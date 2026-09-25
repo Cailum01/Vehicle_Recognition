@@ -1,0 +1,24 @@
+# 虛擬環境與快取
+.venv/
+__pycache__/
+
+# 訓練產物、備份與大檔
+**/runs/
+**/runs_latest/
+backups/
+score_results/
+*.pt
+*.zip
+
+# 大型標註暫存
+auto_augment_processed.json
+curate_reviewed.json
+
+# 排除数据集圖片與標註檔
+track_training/images/
+track_training/labels/
+vehicle_seg_training/images/
+vehicle_seg_training/labels/
+
+# memo
+memo.txt

@@ -1,0 +1,5 @@
+path: C:/Users/Local.User/Vehicle_Recognition/vehicle_seg_training
+train: images/train
+val: images/val
+names:
+  0: RC_Car

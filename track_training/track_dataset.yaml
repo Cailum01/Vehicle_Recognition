@@ -1,0 +1,6 @@
+path: C:/Users/Local.User/Vehicle_Recognition/track_training
+train: images/train
+val: images/train
+names:
+  0: Wall
+  1: Clip Zone

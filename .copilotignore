@@ -1,0 +1,23 @@
+# 排除虛擬環境與快取
+.venv/
+__pycache__/
+
+# 排除備份與模型權重
+backups/
+*.pt
+*.zip
+
+# 排除訓練產出與評分結果
+score_results/
+**/runs/
+**/runs_latest/
+
+# 排除数据集圖片與標註檔
+track_training/images/
+track_training/labels/
+vehicle_seg_training/images/
+vehicle_seg_training/labels/
+
+# 排除大型標註/資料 JSON
+auto_augment_processed.json
+curate_reviewed.json
