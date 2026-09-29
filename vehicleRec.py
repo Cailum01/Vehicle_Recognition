@@ -15,6 +15,30 @@ from tkinter import filedialog
 from ultralytics import YOLO
 
 
+
+def _load_env_file():
+    """載入專案根目錄 .env；已存在的系統環境變數優先。"""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    try:
+        with open(env_path, "r", encoding="utf-8") as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, value = line.split("=", 1)
+                name = name.strip()
+                value = value.strip().strip('"').strip("'")
+                if name and name not in os.environ:
+                    os.environ[name] = value
+    except OSError as error:
+        print(f"[設定警告] 無法讀取 {env_path}: {error}")
+
+
+_load_env_file()
+
+
 def activate_english_keyboard_layout():
     """在 Windows OpenCV 視窗開啟前切換到英文鍵盤配置。"""
     if os.name != "nt":
@@ -103,6 +127,17 @@ def select_video_files():
     )
     root.destroy()
     return list(file_paths)
+
+
+def _env_float(name, default):
+    """讀取浮點設定；未設定或格式錯誤時使用預設值。"""
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return float(default)
+    try:
+        return float(value)
+    except ValueError as error:
+        raise ValueError(f"{name} 必須是數字，目前為 {value!r}") from error
 
 
 def _merge_overlapping_car_polygons(candidates, frame_shape, merge_iou=0.35,
@@ -994,6 +1029,20 @@ class DriftJudgeSystem:
         self.track_merge_center_ratio = float(track_merge_center_ratio)
         self.track_merge_min_distance = float(track_merge_min_distance)
         self.track_merge_containment = float(track_merge_containment)
+        self.vehicle_length_mm = _env_float("VEHICLE_LENGTH_MM", 300.0)
+        self.speed_full_score = _env_float("SPEED_FULL_SCORE", 1000.0)
+        self.angle_full_score = _env_float("ANGLE_FULL_SCORE", 45.0)
+        self.wall_distance_limit = _env_float("WALL_DISTANCE_LIMIT", 2.0)
+        self.score_weights = {
+            "speed": _env_float("SPEED_WEIGHT", 0.10),
+            "angle": _env_float("ANGLE_WEIGHT", 0.30),
+            "route": _env_float("ROUTE_WEIGHT", 0.60),
+            "stability": _env_float("STABILITY_WEIGHT", 0.00),
+        }
+        if not math.isclose(sum(self.score_weights.values()), 1.0, abs_tol=1e-6):
+            raise ValueError("SPEED/ANGLE/ROUTE/STABILITY_WEIGHT 總和必須等於 1.0")
+        if self.vehicle_length_mm <= 0 or self.speed_full_score <= 0:
+            raise ValueError("VEHICLE_LENGTH_MM 與 SPEED_FULL_SCORE 必須大於 0")
 
         # 自訂遙控車模型應固定使用 class 0；若不是，可能誤用 COCO 的 vehicle 類別 (2)
         self.vehicle_class = 0 if os.path.basename(car_model_path).lower() in {"rc_car_model.pt", "best.pt"} else vehicle_class
@@ -1012,6 +1061,7 @@ class DriftJudgeSystem:
         # 賽道資訊設定 [(x1,y1), (x2,y2)...]
         self.walls = []       # 護欄多邊形列表
         self.clip_zones = []  # 得分區多邊形列表
+        self.start_direction = None  # [x1, y1, x2, y2]
         self.track_polygon = []
         
         # 歷史軌跡與成績
@@ -1021,10 +1071,13 @@ class DriftJudgeSystem:
         self.raw_track_last_seen = {}
         self.next_track_id = 1
         self.car_scores = {}
+        self.system_scores = {}
+        self.spin_crash_override = {}
         self.car_events = {}
         self.car_details = {}
         self.car_score_totals = {}
         self.car_score_samples = {}
+        self.car_condition_samples = {}
         self.car_last_observations = {}
         self.car_best_observations = {}
         self.track_color_indices = {}
@@ -1043,6 +1096,7 @@ class DriftJudgeSystem:
             "video_path": os.path.abspath(self.video_path),
             "walls": self.walls,
             "clip_zones": self.clip_zones,
+            "start_direction": self.start_direction,
         }
         with open(self.zones_path, "w", encoding="utf-8") as zones_file:
             json.dump(data, zones_file, ensure_ascii=False, indent=2)
@@ -1062,6 +1116,8 @@ class DriftJudgeSystem:
                 return False
             self.walls = data.get("walls", [])
             self.clip_zones = data.get("clip_zones", [])
+            direction = data.get("start_direction")
+            self.start_direction = direction if isinstance(direction, list) and len(direction) == 4 else None
             self._rebuild_track_polygon()
             loaded = bool(self.walls or self.clip_zones)
             if loaded:
@@ -1173,10 +1229,13 @@ class DriftJudgeSystem:
         self.raw_track_last_seen.clear()
         self.next_track_id = 1
         self.car_scores.clear()
+        self.system_scores.clear()
+        self.spin_crash_override.clear()
         self.car_events.clear()
         self.car_details.clear()
         self.car_score_totals.clear()
         self.car_score_samples.clear()
+        self.car_condition_samples.clear()
         self.car_last_observations.clear()
         self.car_best_observations.clear()
         self.track_color_indices.clear()
@@ -1218,6 +1277,14 @@ class DriftJudgeSystem:
             return False
         with open(label_path, "w", encoding="utf-8") as label_file:
             label_file.write("\n".join(labels) + "\n")
+        if self.start_direction and len(self.start_direction) == 4:
+            direction_path = os.path.join(label_dir, f"track_{stamp}.direction.json")
+            normalized_direction = [
+                self.start_direction[0] / width, self.start_direction[1] / height,
+                self.start_direction[2] / width, self.start_direction[3] / height,
+            ]
+            with open(direction_path, "w", encoding="utf-8") as direction_file:
+                json.dump(normalized_direction, direction_file)
         print(f"[學習資料] 已保存手繪樣本: {os.path.basename(image_path)}")
         return True
 
@@ -1295,6 +1362,7 @@ class DriftJudgeSystem:
 
         self.walls.clear()
         self.clip_zones.clear()
+        self.start_direction = None
         image_path, label_path = best_paths
         with open(label_path, "r", encoding="utf-8") as label_file:
             for line in label_file:
@@ -1308,9 +1376,22 @@ class DriftJudgeSystem:
                     self.walls.append(polygon)
                 elif class_id == 1:
                     self.clip_zones.append(polygon)
+        direction_path = os.path.splitext(label_path)[0] + ".direction.json"
+        if os.path.exists(direction_path):
+            try:
+                with open(direction_path, "r", encoding="utf-8") as direction_file:
+                    normalized_direction = json.load(direction_file)
+                if isinstance(normalized_direction, list) and len(normalized_direction) == 4:
+                    self.start_direction = [
+                        int(normalized_direction[0] * frame_width), int(normalized_direction[1] * frame_height),
+                        int(normalized_direction[2] * frame_width), int(normalized_direction[3] * frame_height),
+                    ]
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                self.start_direction = None
         self._rebuild_track_polygon()
         print(f"[樣張套用] 使用最相似樣張: {os.path.basename(image_path)} | score={best_score:.4f} | "
-              f"護欄 {len(self.walls)} 個，得分區 {len(self.clip_zones)} 個")
+              f"護欄 {len(self.walls)} 個，得分區 {len(self.clip_zones)} 個 | "
+              f"起始方向 {'已套用' if self.start_direction else '未儲存'}")
         return bool(self.walls or self.clip_zones)
 
     def auto_detect_track(self, frame):
@@ -1386,8 +1467,11 @@ class DriftJudgeSystem:
             print("無法讀取影片預覽幀，請確認影片檔案格式是否正常！")
             return False
 
-        # 執行方案 A 自動辨識
-        auto_success = self.auto_detect_track(frame)
+        # 優先使用目前影片完全匹配的已保存 Track；找不到才執行方案 A。
+        auto_success = self._load_zones()
+        if not auto_success:
+            self.start_direction = None
+            auto_success = self.auto_detect_track(frame)
 
         print("\n" + "="*50)
         print("【賽道標註與確認介面】")
@@ -1404,6 +1488,7 @@ class DriftJudgeSystem:
         print("="*50 + "\n")
 
         current_pts = []
+        direction_pts = []
         mode = "WALL"  # WALL or CLIP
         is_manual_mode = not auto_success
 
@@ -1418,6 +1503,14 @@ class DriftJudgeSystem:
                 original_x = min(frame.shape[1] - 1, max(0, int(x / display_scale)))
                 original_y = min(frame.shape[0] - 1, max(0, int(y / display_scale)))
                 current_pts.append((original_x, original_y))
+            elif event == cv2.EVENT_RBUTTONDOWN:
+                original_x = min(frame.shape[1] - 1, max(0, int(x / display_scale)))
+                original_y = min(frame.shape[0] - 1, max(0, int(y / display_scale)))
+                if len(direction_pts) >= 2:
+                    direction_pts.clear()
+                direction_pts.append((original_x, original_y))
+                if len(direction_pts) == 2:
+                    self.start_direction = [*direction_pts[0], *direction_pts[1]]
 
         cv2.setMouseCallback(setup_window, mouse_callback)
 
@@ -1439,6 +1532,13 @@ class DriftJudgeSystem:
                 cv2.putText(display, "CLIP ZONE / 得分區", tuple(clip_center),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
 
+            if self.start_direction and len(self.start_direction) == 4:
+                start = tuple(self.start_direction[:2])
+                end = tuple(self.start_direction[2:])
+                cv2.arrowedLine(display, start, end, (255, 0, 255), 5, cv2.LINE_AA, tipLength=0.25)
+                cv2.putText(display, "START DIRECTION / 起始方向", start,
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2, cv2.LINE_AA)
+
             # 繪製手動標註中之點位 (黃色)
             if len(current_pts) > 0:
                 cv2.polylines(display, [np.array(current_pts)], False, (0, 255, 255), 2)
@@ -1448,7 +1548,9 @@ class DriftJudgeSystem:
             display_frame = cv2.resize(display, (display_width, display_height), interpolation=cv2.INTER_AREA)
             status_source = "AUTO DETECTED" if auto_success and not is_manual_mode else "MANUAL DRAWING"
             mode_label = "DRAWING WALL / 護欄" if mode == "WALL" else "DRAWING CLIP ZONE / 得分區"
-            status_text = f"{status_source} | {mode_label} | Walls: {len(self.walls)} | Clips: {len(self.clip_zones)}"
+            direction_status = "SET" if self.start_direction else "NOT SET"
+            status_text = (f"{status_source} | {mode_label} | Walls: {len(self.walls)} | "
+                           f"Clips: {len(self.clip_zones)} | Start: {direction_status}")
             status_color = (0, 255, 0) if auto_success and not is_manual_mode else (0, 255, 255)
             cv2.putText(display_frame, status_text, (20, 38),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2, cv2.LINE_AA)
@@ -1461,8 +1563,8 @@ class DriftJudgeSystem:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
 
             instructions = [
-                "LEFT CLICK: add point   W: save Wall   Z: save Clip   U: undo",
-                "1/2: type   C: cancel current   R: clear all   ENTER: accept   Q: cancel"
+                "LEFT CLICK: add point   RIGHT CLICK x2: start direction   W: Wall   Z: Clip",
+                "1/2: type   U: undo   I: clear direction   C: cancel   R: clear all   ENTER: accept"
             ]
             panel_top = max(0, display_height - 88)
             cv2.rectangle(display_frame, (10, panel_top), (display_width - 10, display_height - 10), (0, 0, 0), -1)
@@ -1485,6 +1587,8 @@ class DriftJudgeSystem:
             elif key in (ord('r'), ord('R')):
                 self.walls.clear()
                 self.clip_zones.clear()
+                self.start_direction = None
+                direction_pts.clear()
                 current_pts.clear()
                 is_manual_mode = True
                 print("[系統] 已清空標註，啟動 [方案 B] 手動繪製模式。")
@@ -1506,6 +1610,10 @@ class DriftJudgeSystem:
                 mode = "CLIP" if mode == "WALL" else "WALL"
                 current_pts.clear()
                 print(f"[方案 B] 當前標註類別切換為: {mode}")
+            elif key in (ord('i'), ord('I')):
+                self.start_direction = None
+                direction_pts.clear()
+                print("[方案 B] 已清除起始行進方向。")
             elif key == ord('1'):
                 mode = "WALL"
                 current_pts.clear()
@@ -1531,8 +1639,8 @@ class DriftJudgeSystem:
             self._save_zones()
         return accepted
 
-    def calculate_metrics(self, history, bbox=None):
-        """依固定權重計算單次取樣分數，總分上限為 100。"""
+    def calculate_metrics(self, history, bbox=None, polygon=None):
+        """依既有單項公式計算單幀分數；速度使用 segmentation 車長換算。"""
         if len(history) < 2:
             return {
                 "speed": 0, "drift_angle": 0, "is_spin": False, "hit_wall": False,
@@ -1546,38 +1654,55 @@ class DriftJudgeSystem:
         p_curr, a_curr, f_curr = history[-1]
         p_prev, a_prev, f_prev = history[-2]
         
-        # 1. 速度計算
+        # 1. 速度計算：segmentation contour 優先，bbox 僅作缺省估計。
         dt = f_curr - f_prev
         dist = math.hypot(p_curr[0] - p_prev[0], p_curr[1] - p_prev[1])
-        speed = dist * self.video_fps / dt if dt > 0 else 0
+        fallback_length = max(
+            (bbox[2] - bbox[0]) if bbox and len(bbox) == 4 else 1,
+            (bbox[3] - bbox[1]) if bbox and len(bbox) == 4 else 1,
+        )
+        image_length = self._contour_length(polygon, a_curr, fallback_length)
+        mm_per_pixel = self.vehicle_length_mm / image_length
+        speed = dist * mm_per_pixel * self.video_fps / dt if dt > 0 else 0
 
-        # 2. 夾角計算
+        # 2. 行進方向：以位移向量為主，位移過小（近乎靜止）時改用起始行進方向，
+        # 避免車身輪廓 minAreaRect 角度天生 180° 前後不分的問題。
         move_vec = (p_curr[0] - p_prev[0], p_curr[1] - p_prev[1])
         move_angle = math.degrees(math.atan2(move_vec[1], move_vec[0])) % 360
+        movement_magnitude = math.hypot(move_vec[0], move_vec[1])
+        if movement_magnitude >= 1.0:
+            heading_angle = move_angle
+        elif self.start_direction and len(self.start_direction) == 4:
+            heading_angle = math.degrees(math.atan2(
+                self.start_direction[3] - self.start_direction[1],
+                self.start_direction[2] - self.start_direction[0],
+            )) % 360
+        else:
+            heading_angle = float(a_curr) % 360
         drift_angle = abs(a_curr - move_angle)
         if drift_angle > 180:
             drift_angle = 360 - drift_angle
 
-        # 3. Spin 判斷
-        angle_diff = abs(a_curr - a_prev)
-        if angle_diff > 180: angle_diff = 360 - angle_diff
-        is_spin = angle_diff > 100 and speed / max(self.frame_diagonal, 1) < 0.15
+        # Spin / Crash 改由結果畫面人工判定，不在此自動改分。
+        is_spin = False
 
-        # 4. 撞牆與離牆距離
+        # 4. 只在 Scoring Zone 內計算角度與路線。
+        # 沿用既有 Route Score 公式：wall_distance 以車輛中心到牆的距離計算，不可替換基準點。
         hit_wall = False
-        wall_distance = None
+        in_scoring_zone = self._in_scoring_zone(p_curr)
+        wall_distances = []
         if self.walls:
-            wall_distances = []
-            check_points = [p_curr]
-            if bbox is not None:
-                x1, y1, x2, y2 = bbox
-                check_points.extend([(x1, y1), (x2, y1), (x1, y2), (x2, y2)])
             for wall in self.walls:
-                polygon = np.array(wall, dtype=np.int32)
-                wall_distances.append(abs(cv2.pointPolygonTest(polygon, p_curr, True)))
-                if any(cv2.pointPolygonTest(polygon, point, False) >= 0 for point in check_points):
-                    hit_wall = True
-            wall_distance = min(wall_distances)
+                polygon_wall = np.array(wall, dtype=np.int32)
+                wall_distances.append(abs(cv2.pointPolygonTest(polygon_wall, p_curr, True)))
+        wall_distance = min(wall_distances) if wall_distances else None
+
+        # 車尾點：沿「行進方向」的後方，在 segmentation 輪廓中最遠的點；僅用於新增的
+        # 「單幀歸零」判定，不影響上方既有的中心點距離公式。
+        rear_point = self._contour_rear_point(p_curr, heading_angle, polygon, image_length / 2.0)
+        wall_geometry = self._nearest_wall_geometry(rear_point)
+        rear_wall_distance_px = wall_geometry[0] if wall_geometry else None
+        rear_wall_distance_mm = rear_wall_distance_px * mm_per_pixel if rear_wall_distance_px is not None else None
 
         # 最近一段軌跡用於計算穩定度，避免只用兩幀造成分數跳動。
         recent_history = history[-min(len(history), 30):]
@@ -1592,7 +1717,7 @@ class DriftJudgeSystem:
             interval_speed = math.hypot(
                 current_point[0] - previous_point[0],
                 current_point[1] - previous_point[1],
-            ) * self.video_fps / frame_delta
+            ) * mm_per_pixel * self.video_fps / frame_delta
             movement = math.degrees(math.atan2(
                 current_point[1] - previous_point[1],
                 current_point[0] - previous_point[0],
@@ -1603,25 +1728,60 @@ class DriftJudgeSystem:
             speeds.append(interval_speed)
             angles.append(interval_angle)
 
-        speed_mean = float(np.mean(speeds)) if speeds else speed
-        speed_std = float(np.std(speeds)) if speeds else 0.0
-        angle_std = float(np.std(angles)) if angles else 0.0
+        if self.score_weights["stability"] > 0:
+            speed_mean = float(np.mean(speeds)) if speeds else speed
+            speed_std = float(np.std(speeds)) if speeds else 0.0
+            angle_std = float(np.std(angles)) if angles else 0.0
+        else:
+            speed_mean = speed
+            speed_std = 0.0
+            angle_std = 0.0
 
-        # 固定權重：路線 40、角度 20、速度 10、穩定度 30。
-        # 使用容許範圍校準畫面像素，避免正常影片因解析度或偵測微抖被壓到低分。
-        normalized_wall_distance = wall_distance / max(self.frame_diagonal, 1) if wall_distance is not None else 0.0
-        # 以較寬的安全距離區間評估路線，避免牆面標註厚度或解析度使分數變成 0。
-        route_quality = min(1.0, normalized_wall_distance / 0.02, (0.20 - normalized_wall_distance) / 0.12)
-        line_score = max(0.0, min(40.0, route_quality * 40.0)) if wall_distance is not None else 0.0
-        angle_quality = 1.0 - abs(drift_angle - 45.0) / 45.0
+        # 路線距離改用物理尺度（車身長度倍數）校準，不再用畫面對角線比例
+        # （舊版以 frame_diagonal 為基準，單位與 VEHICLE_LENGTH_MM/WALL_DISTANCE_LIMIT 不一致，
+        # 導致實際影片距離幾乎必定落在有效範圍之外、路線恆為 0）。
+        # 「太近」已由車尾距離的單幀歸零規則處理，這裡只需離牆距離越近分數越高：
+        # 剛好等於 WALL_DISTANCE_LIMIT 時給滿分，超過 2 倍 WALL_DISTANCE_LIMIT 時降到 0。
+        wall_distance_mm = wall_distance * mm_per_pixel if wall_distance is not None else None
+        hard_zero_mm = self.wall_distance_limit * self.vehicle_length_mm
+        far_zero_mm = hard_zero_mm * 2.0
+        if wall_distance_mm is None:
+            route_quality = 0.0
+        else:
+            route_quality = max(0.0, min(1.0, (far_zero_mm - wall_distance_mm) / max(far_zero_mm - hard_zero_mm, 1e-6)))
+        line_score = max(0.0, min(40.0, route_quality * 40.0)) if wall_distance_mm is not None else 0.0
+        if wall_geometry and in_scoring_zone:
+            # 得分牆可能是 U 型/曲線，故用車輛目前位置對應的局部線段切線，而非整條牆的平均方向。
+            tangent_vector = (wall_geometry[2][0] - wall_geometry[1][0],
+                              wall_geometry[2][1] - wall_geometry[1][1])
+            if self.start_direction and len(self.start_direction) == 4:
+                reference_vector = (self.start_direction[2] - self.start_direction[0],
+                                    self.start_direction[3] - self.start_direction[1])
+                if (tangent_vector[0] * reference_vector[0] +
+                        tangent_vector[1] * reference_vector[1]) < 0:
+                    tangent_vector = (-tangent_vector[0], -tangent_vector[1])
+            tangent_length = math.hypot(*tangent_vector) or 1.0
+            tangent_unit = (tangent_vector[0] / tangent_length, tangent_vector[1] / tangent_length)
+            heading_radians = math.radians(heading_angle)
+            heading_unit = (math.cos(heading_radians), math.sin(heading_radians))
+            cross_component = heading_unit[0] * tangent_unit[1] - heading_unit[1] * tangent_unit[0]
+            dot_component = heading_unit[0] * tangent_unit[0] + heading_unit[1] * tangent_unit[1]
+            # atan2(|cross|, dot) 直接給出 0~180° 的夾角，符合行進方向 vs 得分牆切線的規格範圍。
+            drift_angle = math.degrees(math.atan2(abs(cross_component), dot_component))
+        else:
+            drift_angle = 0.0
+        # 角度改用門檻式評分：達到 ANGLE_FULL_SCORE 度以上即滿分，不再是「45 度最佳」的舊公式。
+        angle_quality = min(1.0, drift_angle / max(self.angle_full_score, 1e-6))
         angle_score = max(0.0, min(20.0, angle_quality * 20.0))
-        speed_score = min(10.0, speed / max(self.frame_diagonal * 0.025, 1) * 10.0)
+        speed_score = min(10.0, speed / self.speed_full_score * 10.0)
         speed_stability_score = max(0.0, min(10.0, 10.0 * (1.0 - speed_std / max(speed_mean * 0.50, 1.0))))
         angle_stability_score = max(0.0, min(20.0, 20.0 * (1.0 - angle_std / 35.0)))
-        if hit_wall:
+        if not in_scoring_zone:
             line_score = 0.0
-        if is_spin:
-            angle_stability_score = 0.0
+            angle_score = 0.0
+        elif (rear_wall_distance_mm is not None and
+              rear_wall_distance_mm <= self.wall_distance_limit * self.vehicle_length_mm):
+            line_score = 0.0
         total_score = min(100.0, max(0.0, line_score + angle_score + speed_score +
                                      speed_stability_score + angle_stability_score))
 
@@ -1641,7 +1801,14 @@ class DriftJudgeSystem:
             ,"speed_mean": round(speed_mean, 2)
             ,"speed_std": round(speed_std, 2)
             ,"angle_std": round(angle_std, 2)
-            ,"route_ratio": round(normalized_wall_distance, 4)
+            ,"route_ratio": round(route_quality, 4)
+            ,"wall_distance_mm": round(wall_distance_mm, 1) if wall_distance_mm is not None else None
+            ,"hard_zero_mm": round(hard_zero_mm, 1)
+            ,"in_scoring_zone": in_scoring_zone
+            ,"rear_point": [round(value, 2) for value in rear_point]
+            ,"rear_wall_distance_mm": round(rear_wall_distance_mm, 2) if rear_wall_distance_mm is not None else None
+            ,"vehicle_image_length": round(image_length, 2)
+            ,"speed_mm_per_sec": round(speed, 2)
         }
 
     def _save_score_results(self):
@@ -1656,14 +1823,25 @@ class DriftJudgeSystem:
             "video_fps": self.video_fps,
             "walls": self.walls,
             "clip_zones": self.clip_zones,
+            "start_direction": self.start_direction,
+            "settings": {
+                "vehicle_length_mm": self.vehicle_length_mm,
+                "speed_full_score": self.speed_full_score,
+                "angle_full_score": self.angle_full_score,
+                "wall_distance_limit": self.wall_distance_limit,
+                "score_weights": self.score_weights,
+            },
             "cars": {},
         }
         for track_id, score in self.car_scores.items():
             result["cars"][str(track_id)] = {
                 "score": round(float(score), 2),
+                "system_score": round(float(self.system_scores.get(track_id, score)), 2),
+                "spin_crash_override": bool(self.spin_crash_override.get(track_id, False)),
                 "events": self.car_events.get(track_id, {}),
                 "details": self.car_details.get(track_id, {}),
                 "samples": self.car_score_samples.get(track_id, 0),
+                "condition_samples": self.car_condition_samples.get(track_id, {}),
                 "last_observation": self.car_last_observations.get(track_id, {}),
             }
         with open(result_path, "w", encoding="utf-8") as result_file:
@@ -1745,6 +1923,62 @@ class DriftJudgeSystem:
         return palette[self.track_color_indices[track_id]]
 
     @staticmethod
+    def _contour_length(polygon, angle_degrees, fallback=1.0):
+        """取得 segmentation 輪廓沿車身軸線的影像長度。"""
+        points = np.asarray(polygon, dtype=np.float32)
+        if len(points) < 3:
+            return float(fallback)
+        radians_value = math.radians(float(angle_degrees))
+        axis = np.asarray([math.cos(radians_value), math.sin(radians_value)], dtype=np.float32)
+        projections = points @ axis
+        return max(float(projections.max() - projections.min()), 1.0)
+
+    def _contour_rear_point(self, center, heading_angle, polygon, fallback_half_length):
+        """車尾點正式定義：沿車身後方方向，在 segmentation 輪廓中最遠的輪廓點。"""
+        points = np.asarray(polygon, dtype=np.float32)
+        if len(points) < 3:
+            return self._rear_point(center, heading_angle, fallback_half_length)
+        radians_value = math.radians(float(heading_angle))
+        rear_axis = np.asarray([-math.cos(radians_value), -math.sin(radians_value)], dtype=np.float32)
+        projections = points @ rear_axis
+        farthest_point = points[int(np.argmax(projections))]
+        return (float(farthest_point[0]), float(farthest_point[1]))
+
+    @staticmethod
+    def _point_to_segment_distance(point, start, end):
+        point = np.asarray(point, dtype=np.float32)
+        start = np.asarray(start, dtype=np.float32)
+        end = np.asarray(end, dtype=np.float32)
+        segment = end - start
+        denominator = float(segment @ segment)
+        if denominator <= 0:
+            return float(np.linalg.norm(point - start)), start
+        ratio = float(np.clip(((point - start) @ segment) / denominator, 0.0, 1.0))
+        nearest = start + ratio * segment
+        return float(np.linalg.norm(point - nearest)), nearest
+
+    def _nearest_wall_geometry(self, point):
+        """從既有 Barrier 線段找最近局部切線與距離。"""
+        best = None
+        for wall in self.walls:
+            wall_points = np.asarray(wall, dtype=np.float32)
+            if len(wall_points) < 2:
+                continue
+            for start, end in zip(wall_points, np.roll(wall_points, -1, axis=0)):
+                distance, nearest = self._point_to_segment_distance(point, start, end)
+                if best is None or distance < best[0]:
+                    best = (distance, start, end, nearest)
+        return best
+
+    def _in_scoring_zone(self, point):
+        return any(
+            len(zone) >= 3 and cv2.pointPolygonTest(
+                np.asarray(zone, dtype=np.int32), (float(point[0]), float(point[1])), False
+            ) >= 0
+            for zone in self.clip_zones
+        )
+
+    @staticmethod
     def _continuous_axis_angle(previous_angle, current_angle):
         """選擇與上一幀最接近的 180 度等價角，避免車身方向線反轉。"""
         if previous_angle is None:
@@ -1807,6 +2041,11 @@ class DriftJudgeSystem:
 
             # 畫出最終賽道與得分區
             self._draw_track_zones(frame, show_labels=False)
+            if self.start_direction and len(self.start_direction) == 4:
+                cv2.arrowedLine(frame, tuple(self.start_direction[:2]), tuple(self.start_direction[2:]),
+                                (255, 0, 255), 6, cv2.LINE_AA, tipLength=0.25)
+                cv2.putText(frame, "START DIRECTION", tuple(self.start_direction[:2]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 3, cv2.LINE_AA)
 
             if results is not None and results[0].boxes is not None:
                 boxes = results[0].boxes.xyxy.cpu().numpy()
@@ -1885,6 +2124,8 @@ class DriftJudgeSystem:
                     if track_id not in self.car_history:
                         self.car_history[track_id] = []
                         self.car_scores[track_id] = 0
+                        self.system_scores[track_id] = 0
+                        self.spin_crash_override[track_id] = False
                         self.car_events[track_id] = {"crashes": 0, "spins": 0}
                         self.car_score_totals[track_id] = {
                             "line_score": 0.0,
@@ -1894,9 +2135,16 @@ class DriftJudgeSystem:
                             "angle_stability_score": 0.0,
                         }
                         self.car_score_samples[track_id] = 0
+                        self.car_condition_samples[track_id] = {
+                            "speed": 0,
+                            "angle": 0,
+                            "route": 0,
+                            "stability": 0,
+                        }
 
                     self.car_history[track_id].append((center, axis_angle, frame_idx))
-                    current_metrics = self.calculate_metrics(self.car_history[track_id], box.tolist())
+                    current_metrics = self.calculate_metrics(
+                        self.car_history[track_id], box.tolist(), current_observation.get("polygon", []))
                     current_frame_metrics[track_id] = current_metrics.copy()
 
                     # 每 X 幀計算一次
@@ -1909,22 +2157,58 @@ class DriftJudgeSystem:
                             totals[component] += metrics[component]
                         self.car_score_samples[track_id] += 1
                         sample_count = self.car_score_samples[track_id]
-                        self.car_scores[track_id] = min(100.0, max(0.0, sum(
-                            totals[component] / sample_count for component in totals
-                        )))
-                        if metrics["hit_wall"]:
-                            self.car_events[track_id]["crashes"] += 1
-                        if metrics["is_spin"]:
-                            self.car_events[track_id]["spins"] += 1
+                        condition_samples = self.car_condition_samples[track_id]
+                        if self.score_weights["speed"] > 0:
+                            condition_samples["speed"] += 1
+                        if metrics["in_scoring_zone"]:
+                            if self.score_weights["angle"] > 0:
+                                condition_samples["angle"] += 1
+                            if self.score_weights["route"] > 0:
+                                condition_samples["route"] += 1
+                        if self.score_weights["stability"] > 0:
+                            condition_samples["stability"] += 1
+                        averages = {
+                            component: totals[component] / max(1, sample_count)
+                            for component in totals
+                        }
+                        speed_average = totals["speed_score"] / max(1, condition_samples["speed"])
+                        angle_average = totals["angle_score"] / max(1, condition_samples["angle"])
+                        route_average = totals["line_score"] / max(1, condition_samples["route"])
+                        stability_average = (
+                            (totals["speed_stability_score"] + totals["angle_stability_score"]) /
+                            condition_samples["stability"]
+                            if condition_samples["stability"] > 0 else 0.0
+                        )
+                        weighted_score = (
+                            speed_average / 10.0 * 100.0 * self.score_weights["speed"] +
+                            angle_average / 20.0 * 100.0 * self.score_weights["angle"] +
+                            route_average / 40.0 * 100.0 * self.score_weights["route"] +
+                            stability_average / 30.0 * 100.0 * self.score_weights["stability"]
+                        )
+                        self.system_scores[track_id] = min(100.0, max(0.0, weighted_score))
+                        self.car_scores[track_id] = (
+                            0.0 if self.spin_crash_override.get(track_id) else self.system_scores[track_id]
+                        )
                         self.car_details[track_id] = {
                             key: value / sample_count if key in totals else value
                             for key, value in metrics.items()
                         }
+                        self.car_details[track_id]["speed_score"] = speed_average
+                        self.car_details[track_id]["angle_score"] = angle_average
+                        self.car_details[track_id]["line_score"] = route_average
+                        self.car_details[track_id]["speed_stability_score"] = (
+                            totals["speed_stability_score"] / condition_samples["stability"]
+                            if condition_samples["stability"] > 0 else 0.0
+                        )
+                        self.car_details[track_id]["angle_stability_score"] = (
+                            totals["angle_stability_score"] / condition_samples["stability"]
+                            if condition_samples["stability"] > 0 else 0.0
+                        )
                         
                         cv2.circle(frame, center, 4, (0, 0, 255), -1)
 
             display_frame = cv2.resize(frame, (display_width, display_height), interpolation=cv2.INTER_AREA)
-            cv2.putText(display_frame, "Enter-離開", (20, 38),
+            cv2.putText(display_frame, "S-提前結算  Enter-離開", (20, 38),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
             for row, track_id in enumerate(sorted(current_frame_metrics), start=1):
                 metrics = current_frame_metrics[track_id]
@@ -1937,7 +2221,7 @@ class DriftJudgeSystem:
             target_time = playback_start + max(0, frame_idx - 1) / self.video_fps
             wait_ms = max(1, int((target_time - time.perf_counter()) * 1000))
             key = cv2.waitKey(wait_ms) & 0xFF
-            if key in (ord('q'), 13):
+            if key in (ord('q'), 13, ord('s')):
                 break
             elif key == ord('w'):
                 self.display_options["walls"] = not self.display_options["walls"]
@@ -2064,7 +2348,8 @@ class DriftJudgeSystem:
                         current[0][0] - previous[0][0],
                         current[0][1] - previous[0][1],
                     )
-                    point_speed = distance * self.video_fps / frame_delta
+                    point_mm_per_pixel = self.vehicle_length_mm / max(rear_half_length * 2, 1.0)
+                    point_speed = distance * point_mm_per_pixel * self.video_fps / frame_delta
                     movement_angle = math.degrees(math.atan2(
                         current[0][1] - previous[0][1],
                         current[0][0] - previous[0][0],
@@ -2109,7 +2394,7 @@ class DriftJudgeSystem:
             cv2.putText(summary_frame, "FINAL SCORE", summary_ui_point(36, 62),
                         cv2.FONT_HERSHEY_SIMPLEX, summary_font(1.35), (0, 255, 255),
                         summary_thickness(3), cv2.LINE_AA)
-            cv2.putText(summary_frame, "R: replay | Q/ENTER: close", summary_ui_point(36, 90),
+            cv2.putText(summary_frame, "S: Spin/Crash override | R: replay | Q/ENTER: close", summary_ui_point(36, 90),
                         cv2.FONT_HERSHEY_SIMPLEX, summary_font(0.7), (255, 255, 255),
                         summary_thickness(2), cv2.LINE_AA)
 
@@ -2119,14 +2404,22 @@ class DriftJudgeSystem:
                     events = self.car_events.get(track_id, {"crashes": 0, "spins": 0})
                     detail = self.car_details.get(track_id, {})
                     summary = (f"Car {track_id}: SCORE {self.car_scores[track_id]:.1f}/100 | "
-                               f"CRASH {events['crashes']} | SPIN {events['spins']}")
+                               f"SYSTEM {self.system_scores.get(track_id, 0.0):.1f} | "
+                               f"{'SPIN/CRASH' if self.spin_crash_override.get(track_id) else 'NORMAL'}")
                     cv2.putText(summary_frame, summary, summary_ui_point(40, row_y),
                                 cv2.FONT_HERSHEY_SIMPLEX, summary_font(0.95), (255, 255, 255),
                                 summary_thickness(3), cv2.LINE_AA)
-                    breakdown = (f"Route {detail.get('line_score', 0):.1f}/40  "
-                                 f"Angle {detail.get('angle_score', 0):.1f}/20  "
-                                 f"Speed {detail.get('speed_score', 0):.1f}/10  "
-                                 f"Stability {detail.get('speed_stability_score', 0) + detail.get('angle_stability_score', 0):.1f}/30")
+                    breakdown_parts = []
+                    if self.score_weights["speed"] > 0:
+                        breakdown_parts.append(f"速度 {detail.get('speed_score', 0) / 10 * self.score_weights['speed'] * 100:.1f}")
+                    if self.score_weights["angle"] > 0:
+                        breakdown_parts.append(f"角度 {detail.get('angle_score', 0) / 20 * self.score_weights['angle'] * 100:.1f}")
+                    if self.score_weights["route"] > 0:
+                        breakdown_parts.append(f"路線 {detail.get('line_score', 0) / 40 * self.score_weights['route'] * 100:.1f}")
+                    if self.score_weights["stability"] > 0:
+                        stability = detail.get('speed_stability_score', 0) + detail.get('angle_stability_score', 0)
+                        breakdown_parts.append(f"穩定度 {stability / 30 * self.score_weights['stability'] * 100:.1f}")
+                    breakdown = "  ".join(breakdown_parts)
                     cv2.putText(summary_frame, breakdown, summary_ui_point(40, row_y + 24),
                                 cv2.FONT_HERSHEY_SIMPLEX, summary_font(0.7), (180, 255, 180),
                                 summary_thickness(2), cv2.LINE_AA)
@@ -2151,6 +2444,15 @@ class DriftJudgeSystem:
                     self._reset_analysis_state()
                     print("[重播] 已清除上一輪分數，重新分析影片...")
                     return self.process_video()
+                if key == ord('s') and self.car_scores:
+                    for track_id in self.car_scores:
+                        self.spin_crash_override[track_id] = not self.spin_crash_override.get(track_id, False)
+                        self.car_scores[track_id] = (
+                            0.0 if self.spin_crash_override[track_id] else self.system_scores.get(track_id, 0.0)
+                        )
+                    print("[人工判定] Spin / Crash override "
+                          f"{'ON' if any(self.spin_crash_override.values()) else 'OFF'}")
+                    break
                 if key in (ord('q'), 13):
                     break
 
