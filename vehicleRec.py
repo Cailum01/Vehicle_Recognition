@@ -1467,11 +1467,8 @@ class DriftJudgeSystem:
             print("無法讀取影片預覽幀，請確認影片檔案格式是否正常！")
             return False
 
-        # 優先使用目前影片完全匹配的已保存 Track；找不到才執行方案 A。
-        auto_success = self._load_zones()
-        if not auto_success:
-            self.start_direction = None
-            auto_success = self.auto_detect_track(frame)
+        # 執行方案 A 自動辨識
+        auto_success = self.auto_detect_track(frame)
 
         print("\n" + "="*50)
         print("【賽道標註與確認介面】")
@@ -1488,7 +1485,6 @@ class DriftJudgeSystem:
         print("="*50 + "\n")
 
         current_pts = []
-        direction_pts = []
         mode = "WALL"  # WALL or CLIP
         is_manual_mode = not auto_success
 
@@ -1629,7 +1625,6 @@ class DriftJudgeSystem:
         cv2.destroyAllWindows()
         if accepted and is_manual_mode:
             self._rebuild_track_polygon()
-            self._save_zones()
             if self._save_manual_training_sample(frame):
                 if self.enable_learning:
                     self._train_from_manual_samples()
@@ -1653,7 +1648,7 @@ class DriftJudgeSystem:
 
         p_curr, a_curr, f_curr = history[-1]
         p_prev, a_prev, f_prev = history[-2]
-        
+
         # 1. 速度計算：segmentation contour 優先，bbox 僅作缺省估計。
         dt = f_curr - f_prev
         dist = math.hypot(p_curr[0] - p_prev[0], p_curr[1] - p_prev[1])
@@ -1679,32 +1674,24 @@ class DriftJudgeSystem:
             )) % 360
         else:
             heading_angle = float(a_curr) % 360
-        drift_angle = abs(a_curr - move_angle)
-        if drift_angle > 180:
-            drift_angle = 360 - drift_angle
 
         # Spin / Crash 改由結果畫面人工判定，不在此自動改分。
         is_spin = False
-
-        # 4. 只在 Scoring Zone 內計算角度與路線。
-        # 沿用既有 Route Score 公式：wall_distance 以車輛中心到牆的距離計算，不可替換基準點。
         hit_wall = False
         in_scoring_zone = self._in_scoring_zone(p_curr)
-        wall_distances = []
-        if self.walls:
-            for wall in self.walls:
-                polygon_wall = np.array(wall, dtype=np.int32)
-                wall_distances.append(abs(cv2.pointPolygonTest(polygon_wall, p_curr, True)))
-        wall_distance = min(wall_distances) if wall_distances else None
 
-        # 車尾點：沿「行進方向」的後方，在 segmentation 輪廓中最遠的點；僅用於新增的
-        # 「單幀歸零」判定，不影響上方既有的中心點距離公式。
+        # 3. 車尾點：沿行進方向後方，在 segmentation 輪廓中最遠的點。
+        #    路線與牆切線一律以車尾為基準。
         rear_point = self._contour_rear_point(p_curr, heading_angle, polygon, image_length / 2.0)
         wall_geometry = self._nearest_wall_geometry(rear_point)
         rear_wall_distance_px = wall_geometry[0] if wall_geometry else None
-        rear_wall_distance_mm = rear_wall_distance_px * mm_per_pixel if rear_wall_distance_px is not None else None
+        rear_wall_distance_mm = (
+            rear_wall_distance_px * mm_per_pixel if rear_wall_distance_px is not None else None
+        )
+        wall_distance = rear_wall_distance_px
+        wall_distance_mm = rear_wall_distance_mm
 
-        # 最近一段軌跡用於計算穩定度，避免只用兩幀造成分數跳動。
+        # 4. 穩定度：最近一段軌跡，避免只用兩幀造成分數跳動。
         recent_history = history[-min(len(history), 30):]
         speeds = []
         angles = []
@@ -1737,78 +1724,98 @@ class DriftJudgeSystem:
             speed_std = 0.0
             angle_std = 0.0
 
-        # 路線距離改用物理尺度（車身長度倍數）校準，不再用畫面對角線比例
-        # （舊版以 frame_diagonal 為基準，單位與 VEHICLE_LENGTH_MM/WALL_DISTANCE_LIMIT 不一致，
-        # 導致實際影片距離幾乎必定落在有效範圍之外、路線恆為 0）。
-        # 「太近」已由車尾距離的單幀歸零規則處理，這裡只需離牆距離越近分數越高：
-        # 剛好等於 WALL_DISTANCE_LIMIT 時給滿分，超過 2 倍 WALL_DISTANCE_LIMIT 時降到 0。
-        wall_distance_mm = wall_distance * mm_per_pixel if wall_distance is not None else None
-        hard_zero_mm = self.wall_distance_limit * self.vehicle_length_mm
-        far_zero_mm = hard_zero_mm * 2.0
+        # 5. 路線分數：車尾離牆越近越高；≤ ideal 滿分，≥ 2×ideal 為 0，中間線性。
+        #    「貼得很近 / 超出」仍給滿分，不再因太近強制歸零。
+        ideal_mm = self.wall_distance_limit * self.vehicle_length_mm
+        far_mm = ideal_mm * 2.0
+        hard_zero_mm = ideal_mm
         if wall_distance_mm is None:
             route_quality = 0.0
         else:
-            route_quality = max(0.0, min(1.0, (far_zero_mm - wall_distance_mm) / max(far_zero_mm - hard_zero_mm, 1e-6)))
-        line_score = max(0.0, min(40.0, route_quality * 40.0)) if wall_distance_mm is not None else 0.0
+            route_quality = max(
+                0.0,
+                min(1.0, (far_mm - wall_distance_mm) / max(far_mm - ideal_mm, 1e-6)),
+            )
+        line_score = (
+            max(0.0, min(40.0, route_quality * 40.0)) if wall_distance_mm is not None else 0.0
+        )
+
+        # 6. 角度分數：僅在得分區內，用位移方向 vs 牆局部切線（支援 U 型段）。
+        #    得分區外 drift_angle 強制為 0（需求）。
         if wall_geometry and in_scoring_zone:
-            # 得分牆可能是 U 型/曲線，故用車輛目前位置對應的局部線段切線，而非整條牆的平均方向。
-            tangent_vector = (wall_geometry[2][0] - wall_geometry[1][0],
-                              wall_geometry[2][1] - wall_geometry[1][1])
+            tangent_vector = (
+                wall_geometry[2][0] - wall_geometry[1][0],
+                wall_geometry[2][1] - wall_geometry[1][1],
+            )
             if self.start_direction and len(self.start_direction) == 4:
-                reference_vector = (self.start_direction[2] - self.start_direction[0],
-                                    self.start_direction[3] - self.start_direction[1])
-                if (tangent_vector[0] * reference_vector[0] +
-                        tangent_vector[1] * reference_vector[1]) < 0:
+                reference_vector = (
+                    self.start_direction[2] - self.start_direction[0],
+                    self.start_direction[3] - self.start_direction[1],
+                )
+                if (tangent_vector[0] * reference_vector[0]
+                        + tangent_vector[1] * reference_vector[1]) < 0:
                     tangent_vector = (-tangent_vector[0], -tangent_vector[1])
             tangent_length = math.hypot(*tangent_vector) or 1.0
             tangent_unit = (tangent_vector[0] / tangent_length, tangent_vector[1] / tangent_length)
-            heading_radians = math.radians(heading_angle)
-            heading_unit = (math.cos(heading_radians), math.sin(heading_radians))
-            cross_component = heading_unit[0] * tangent_unit[1] - heading_unit[1] * tangent_unit[0]
-            dot_component = heading_unit[0] * tangent_unit[0] + heading_unit[1] * tangent_unit[1]
-            # atan2(|cross|, dot) 直接給出 0~180° 的夾角，符合行進方向 vs 得分牆切線的規格範圍。
-            drift_angle = math.degrees(math.atan2(abs(cross_component), dot_component))
+
+            # 改用車身軸向（history 裡的 a_curr），不要用 heading
+            body_radians = math.radians(float(a_curr) % 360.0)
+            body_unit = (math.cos(body_radians), math.sin(body_radians))
+            cross_component = body_unit[0] * tangent_unit[1] - body_unit[1] * tangent_unit[0]
+            dot_component = body_unit[0] * tangent_unit[0] + body_unit[1] * tangent_unit[1]
+            # 與無向牆線夾角 0~90°（車頭/車尾 180° 不影響）
+            drift_angle = math.degrees(math.atan2(abs(cross_component), abs(dot_component)))
         else:
             drift_angle = 0.0
-        # 角度改用門檻式評分：達到 ANGLE_FULL_SCORE 度以上即滿分，不再是「45 度最佳」的舊公式。
+
         angle_quality = min(1.0, drift_angle / max(self.angle_full_score, 1e-6))
         angle_score = max(0.0, min(20.0, angle_quality * 20.0))
         speed_score = min(10.0, speed / self.speed_full_score * 10.0)
-        speed_stability_score = max(0.0, min(10.0, 10.0 * (1.0 - speed_std / max(speed_mean * 0.50, 1.0))))
+        speed_stability_score = max(
+            0.0, min(10.0, 10.0 * (1.0 - speed_std / max(speed_mean * 0.50, 1.0)))
+        )
         angle_stability_score = max(0.0, min(20.0, 20.0 * (1.0 - angle_std / 35.0)))
+
+        # 只在「不在得分區」時清路線與角度；不再因車尾太近把路線打成 0。
         if not in_scoring_zone:
             line_score = 0.0
             angle_score = 0.0
-        elif (rear_wall_distance_mm is not None and
-              rear_wall_distance_mm <= self.wall_distance_limit * self.vehicle_length_mm):
-            line_score = 0.0
-        total_score = min(100.0, max(0.0, line_score + angle_score + speed_score +
-                                     speed_stability_score + angle_stability_score))
+
+        total_score = min(
+            100.0,
+            max(
+                0.0,
+                line_score + angle_score + speed_score
+                + speed_stability_score + angle_stability_score,
+            ),
+        )
 
         return {
             "speed": round(speed, 2),
             "drift_angle": round(drift_angle, 1),
             "is_spin": is_spin,
             "hit_wall": hit_wall,
-            "score_delta": round(total_score, 1)
-            ,"total_score": round(total_score, 1)
-            ,"wall_distance": round(wall_distance, 1) if wall_distance is not None else None
-            ,"line_score": round(line_score, 1)
-            ,"speed_score": round(speed_score, 1)
-            ,"angle_score": round(angle_score, 1)
-            ,"speed_stability_score": round(speed_stability_score, 1)
-            ,"angle_stability_score": round(angle_stability_score, 1)
-            ,"speed_mean": round(speed_mean, 2)
-            ,"speed_std": round(speed_std, 2)
-            ,"angle_std": round(angle_std, 2)
-            ,"route_ratio": round(route_quality, 4)
-            ,"wall_distance_mm": round(wall_distance_mm, 1) if wall_distance_mm is not None else None
-            ,"hard_zero_mm": round(hard_zero_mm, 1)
-            ,"in_scoring_zone": in_scoring_zone
-            ,"rear_point": [round(value, 2) for value in rear_point]
-            ,"rear_wall_distance_mm": round(rear_wall_distance_mm, 2) if rear_wall_distance_mm is not None else None
-            ,"vehicle_image_length": round(image_length, 2)
-            ,"speed_mm_per_sec": round(speed, 2)
+            "score_delta": round(total_score, 1),
+            "total_score": round(total_score, 1),
+            "wall_distance": round(wall_distance, 1) if wall_distance is not None else None,
+            "line_score": round(line_score, 1),
+            "speed_score": round(speed_score, 1),
+            "angle_score": round(angle_score, 1),
+            "speed_stability_score": round(speed_stability_score, 1),
+            "angle_stability_score": round(angle_stability_score, 1),
+            "speed_mean": round(speed_mean, 2),
+            "speed_std": round(speed_std, 2),
+            "angle_std": round(angle_std, 2),
+            "route_ratio": round(route_quality, 4),
+            "wall_distance_mm": round(wall_distance_mm, 1) if wall_distance_mm is not None else None,
+            "hard_zero_mm": round(hard_zero_mm, 1),
+            "in_scoring_zone": in_scoring_zone,
+            "rear_point": [round(value, 2) for value in rear_point],
+            "rear_wall_distance_mm": (
+                round(rear_wall_distance_mm, 2) if rear_wall_distance_mm is not None else None
+            ),
+            "vehicle_image_length": round(image_length, 2),
+            "speed_mm_per_sec": round(speed, 2),
         }
 
     def _save_score_results(self):
@@ -2160,7 +2167,7 @@ class DriftJudgeSystem:
                         condition_samples = self.car_condition_samples[track_id]
                         if self.score_weights["speed"] > 0:
                             condition_samples["speed"] += 1
-                        if metrics["in_scoring_zone"]:
+                        if metrics.get("in_scoring_zone", False):
                             if self.score_weights["angle"] > 0:
                                 condition_samples["angle"] += 1
                             if self.score_weights["route"] > 0:
