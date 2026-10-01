@@ -1678,7 +1678,10 @@ class DriftJudgeSystem:
         # Spin / Crash 改由結果畫面人工判定，不在此自動改分。
         is_spin = False
         hit_wall = False
-        in_scoring_zone = self._in_scoring_zone(p_curr)
+        has_scoring_zones = any(len(zone) >= 3 for zone in self.clip_zones)
+        in_scoring_zone = (
+            self._in_scoring_zone(p_curr, polygon) if has_scoring_zones else True
+        )
 
         # 3. 車尾點：沿行進方向後方，在 segmentation 輪廓中最遠的點。
         #    路線與牆切線一律以車尾為基準。
@@ -1724,17 +1727,24 @@ class DriftJudgeSystem:
             speed_std = 0.0
             angle_std = 0.0
 
-        # 5. 路線分數：車尾離牆越近越高；≤ ideal 滿分，≥ 2×ideal 為 0，中間線性。
-        #    「貼得很近 / 超出」仍給滿分，不再因太近強制歸零。
+        # 5. 路線分數：超過門檻為 0，距離越近分數越高；車尾進入牆區視為越線滿分。
         ideal_mm = self.wall_distance_limit * self.vehicle_length_mm
-        far_mm = ideal_mm * 2.0
         hard_zero_mm = ideal_mm
-        if wall_distance_mm is None:
+        crossed_wall = any(
+            len(wall) >= 3 and cv2.pointPolygonTest(
+                np.asarray(wall, dtype=np.int32),
+                (float(rear_point[0]), float(rear_point[1])), False
+            ) >= 0
+            for wall in self.walls
+        )
+        if crossed_wall:
+            route_quality = 1.0
+        elif wall_distance_mm is None:
             route_quality = 0.0
         else:
             route_quality = max(
                 0.0,
-                min(1.0, (far_mm - wall_distance_mm) / max(far_mm - ideal_mm, 1e-6)),
+                min(1.0, (ideal_mm - wall_distance_mm) / max(ideal_mm, 1e-6)),
             )
         line_score = (
             max(0.0, min(40.0, route_quality * 40.0)) if wall_distance_mm is not None else 0.0
@@ -1809,6 +1819,7 @@ class DriftJudgeSystem:
             "route_ratio": round(route_quality, 4),
             "wall_distance_mm": round(wall_distance_mm, 1) if wall_distance_mm is not None else None,
             "hard_zero_mm": round(hard_zero_mm, 1),
+            "crossed_wall": crossed_wall,
             "in_scoring_zone": in_scoring_zone,
             "rear_point": [round(value, 2) for value in rear_point],
             "rear_wall_distance_mm": (
@@ -1977,13 +1988,39 @@ class DriftJudgeSystem:
                     best = (distance, start, end, nearest)
         return best
 
-    def _in_scoring_zone(self, point):
-        return any(
-            len(zone) >= 3 and cv2.pointPolygonTest(
-                np.asarray(zone, dtype=np.int32), (float(point[0]), float(point[1])), False
-            ) >= 0
-            for zone in self.clip_zones
-        )
+    @staticmethod
+    def _polygons_overlap(first, second):
+        first = np.asarray(first, dtype=np.int32).reshape(-1, 2)
+        second = np.asarray(second, dtype=np.int32).reshape(-1, 2)
+        left = max(int(first[:, 0].min()), int(second[:, 0].min()))
+        top = max(int(first[:, 1].min()), int(second[:, 1].min()))
+        right = min(int(first[:, 0].max()), int(second[:, 0].max()))
+        bottom = min(int(first[:, 1].max()), int(second[:, 1].max()))
+        if left > right or top > bottom:
+            return False
+
+        shape = (bottom - top + 1, right - left + 1)
+        offset = np.asarray([left, top], dtype=np.int32)
+        first_mask = np.zeros(shape, dtype=np.uint8)
+        second_mask = np.zeros(shape, dtype=np.uint8)
+        cv2.fillPoly(first_mask, [first - offset], 255)
+        cv2.fillPoly(second_mask, [second - offset], 255)
+        return cv2.countNonZero(cv2.bitwise_and(first_mask, second_mask)) > 0
+
+    def _in_scoring_zone(self, point, vehicle_polygon=None):
+        vehicle_polygon = np.asarray(vehicle_polygon, dtype=np.int32) if vehicle_polygon is not None else None
+        has_vehicle_polygon = vehicle_polygon is not None and vehicle_polygon.ndim == 2 and len(vehicle_polygon) >= 3
+        for zone in self.clip_zones:
+            if len(zone) < 3:
+                continue
+            zone_polygon = np.asarray(zone, dtype=np.int32)
+            if cv2.pointPolygonTest(
+                    zone_polygon, (float(point[0]), float(point[1])), False) >= 0:
+                return True
+            if (has_vehicle_polygon and
+                    self._polygons_overlap(vehicle_polygon, zone_polygon)):
+                return True
+        return False
 
     @staticmethod
     def _continuous_axis_angle(previous_angle, current_angle):
@@ -2019,7 +2056,9 @@ class DriftJudgeSystem:
         track_interval = self.track_interval
         playback_start = time.perf_counter()
         last_frame = None
+        first_frame = None
         last_original_frame = None
+        no_detection_frame = None
         last_display_frame = None
 
         while cap.isOpened():
@@ -2028,6 +2067,8 @@ class DriftJudgeSystem:
                 break
 
             last_frame = frame.copy()
+            if first_frame is None:
+                first_frame = frame.copy()
             last_original_frame = frame.copy()
 
             if not window_initialized:
@@ -2045,6 +2086,8 @@ class DriftJudgeSystem:
                 tracking_classes = None if self.vehicle_class < 0 else [self.vehicle_class]
                 results = self.car_model.track(frame, persist=True, classes=tracking_classes,
                                                verbose=False, imgsz=640)
+                if not results or results[0].boxes is None or len(results[0].boxes) == 0:
+                    no_detection_frame = frame.copy()
 
             # 畫出最終賽道與得分區
             self._draw_track_zones(frame, show_labels=False)
@@ -2245,7 +2288,17 @@ class DriftJudgeSystem:
 
         cap.release()
         if last_original_frame is not None or last_display_frame is not None:
-            summary_frame = (last_original_frame.copy() if last_original_frame is not None
+            uses_nonfinal_background = no_detection_frame is not None or first_frame is not None
+            if no_detection_frame is not None:
+                summary_background = no_detection_frame
+                print("[結算底圖] 使用無車輛偵測畫面。")
+            elif first_frame is not None:
+                summary_background = first_frame
+                print("[結算底圖] 未找到無車畫面，改用影片第一幀。")
+            else:
+                summary_background = last_original_frame
+                print("[結算底圖] 沒有可用偵測結果，沿用最後一幀。")
+            summary_frame = (summary_background.copy() if summary_background is not None
                              else last_display_frame.copy())
             summary_scale = display_width / max(1, summary_frame.shape[1])
 
@@ -2275,6 +2328,8 @@ class DriftJudgeSystem:
                     cv2.polylines(summary_frame, [trajectory], False, (0, 0, 0), summary_thickness(8), cv2.LINE_AA)
                     cv2.polylines(summary_frame, [trajectory], False, (255, 255, 255), summary_thickness(6), cv2.LINE_AA)
                     cv2.polylines(summary_frame, [trajectory], False, track_color, summary_thickness(3), cv2.LINE_AA)
+                if uses_nonfinal_background:
+                    continue
                 observation = self.car_last_observations.get(track_id, {})
                 bbox = observation.get("bbox", [])
                 polygon = observation.get("polygon", [])
@@ -2317,7 +2372,11 @@ class DriftJudgeSystem:
                     heading_angle = int(round(float(observation.get("angle", 0)))) % 360
                     cv2.putText(summary_frame, f"{heading_angle}°",
                                 (angle_end[0] + summary_thickness(8), angle_end[1]),
-                                cv2.FONT_HERSHEY_SIMPLEX, summary_font(0.75), track_color,
+                                cv2.FONT_HERSHEY_SIMPLEX, summary_font(0.85), (0, 0, 0),
+                                summary_thickness(5), cv2.LINE_AA)
+                    cv2.putText(summary_frame, f"{heading_angle}°",
+                                (angle_end[0] + summary_thickness(8), angle_end[1]),
+                                cv2.FONT_HERSHEY_SIMPLEX, summary_font(0.85), (255, 255, 255),
                                 summary_thickness(2), cv2.LINE_AA)
                 if len(bbox) == 4:
                     label_x, label_y = bbox[0], max(30, bbox[1] - 10)
@@ -2382,10 +2441,10 @@ class DriftJudgeSystem:
                     angle_text = f"{abs(round(drift_angle))}°"
                     text_origin = (angle_end[0] + summary_thickness(12), angle_end[1])
                     cv2.putText(summary_frame, angle_text, text_origin,
-                                cv2.FONT_HERSHEY_SIMPLEX, summary_font(0.8), (0, 0, 0),
-                                summary_thickness(4), cv2.LINE_AA)
+                                cv2.FONT_HERSHEY_SIMPLEX, summary_font(0.9), (0, 0, 0),
+                                summary_thickness(5), cv2.LINE_AA)
                     cv2.putText(summary_frame, angle_text, text_origin,
-                                cv2.FONT_HERSHEY_SIMPLEX, summary_font(0.8), track_color,
+                                cv2.FONT_HERSHEY_SIMPLEX, summary_font(0.9), (255, 255, 255),
                                 summary_thickness(2), cv2.LINE_AA)
                     speed_text = f"{point_speed:.1f}"
                     speed_origin = (label_point[0] + summary_thickness(15),
