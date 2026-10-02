@@ -1485,6 +1485,7 @@ class DriftJudgeSystem:
         print("="*50 + "\n")
 
         current_pts = []
+        direction_pts = []
         mode = "WALL"  # WALL or CLIP
         is_manual_mode = not auto_success
 
@@ -1684,15 +1685,25 @@ class DriftJudgeSystem:
         )
 
         # 3. 車尾點：沿行進方向後方，在 segmentation 輪廓中最遠的點。
-        #    路線與牆切線一律以車尾為基準。
+        #    角度計算仍使用車尾附近的牆切線；路線距離改用整個車身輪廓。
         rear_point = self._contour_rear_point(p_curr, heading_angle, polygon, image_length / 2.0)
         wall_geometry = self._nearest_wall_geometry(rear_point)
         rear_wall_distance_px = wall_geometry[0] if wall_geometry else None
         rear_wall_distance_mm = (
             rear_wall_distance_px * mm_per_pixel if rear_wall_distance_px is not None else None
         )
-        wall_distance = rear_wall_distance_px
-        wall_distance_mm = rear_wall_distance_mm
+        vehicle_polygon = np.asarray(polygon, dtype=np.float32)
+        if vehicle_polygon.ndim != 2 or len(vehicle_polygon) < 3:
+            if bbox is not None and len(bbox) == 4:
+                x1, y1, x2, y2 = bbox
+                vehicle_polygon = np.asarray(
+                    [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32
+                )
+            else:
+                vehicle_polygon = np.empty((0, 2), dtype=np.float32)
+        route_wall_geometry = self._nearest_wall_geometry_to_polygon(vehicle_polygon)
+        wall_distance = route_wall_geometry[0] if route_wall_geometry else None
+        wall_distance_mm = wall_distance * mm_per_pixel if wall_distance is not None else None
 
         # 4. 穩定度：最近一段軌跡，避免只用兩幀造成分數跳動。
         recent_history = history[-min(len(history), 30):]
@@ -1730,12 +1741,9 @@ class DriftJudgeSystem:
         # 5. 路線分數：超過門檻為 0，距離越近分數越高；車尾進入牆區視為越線滿分。
         ideal_mm = self.wall_distance_limit * self.vehicle_length_mm
         hard_zero_mm = ideal_mm
-        crossed_wall = any(
-            len(wall) >= 3 and cv2.pointPolygonTest(
-                np.asarray(wall, dtype=np.int32),
-                (float(rear_point[0]), float(rear_point[1])), False
-            ) >= 0
-            for wall in self.walls
+        crossed_wall = (
+            self._vehicle_overlaps_wall(vehicle_polygon) or
+            self._trajectory_crosses_wall(p_prev, p_curr)
         )
         if crossed_wall:
             route_quality = 1.0
@@ -1988,6 +1996,78 @@ class DriftJudgeSystem:
                     best = (distance, start, end, nearest)
         return best
 
+    def _nearest_wall_geometry_to_polygon(self, polygon):
+        """取得車身 polygon 到所有牆邊界的最短距離。"""
+        vehicle_points = np.asarray(polygon, dtype=np.float32).reshape(-1, 2)
+        if len(vehicle_points) < 2:
+            return None
+
+        best = None
+        vehicle_edges = zip(vehicle_points, np.roll(vehicle_points, -1, axis=0))
+        vehicle_edges = list(vehicle_edges) if len(vehicle_points) >= 3 else []
+        for wall in self.walls:
+            wall_points = np.asarray(wall, dtype=np.float32)
+            if len(wall_points) < 2:
+                continue
+            if (len(vehicle_points) >= 3 and len(wall_points) >= 3 and
+                    self._polygons_overlap(vehicle_points, wall_points)):
+                return (0.0, wall_points[0], wall_points[1], wall_points[0])
+
+            wall_edges = zip(wall_points, np.roll(wall_points, -1, axis=0))
+            wall_edges = list(wall_edges)
+            for vehicle_point in vehicle_points:
+                for wall_start, wall_end in wall_edges:
+                    distance, nearest_wall = self._point_to_segment_distance(
+                        vehicle_point, wall_start, wall_end
+                    )
+                    if best is None or distance < best[0]:
+                        best = (distance, wall_start, wall_end, nearest_wall)
+            for wall_point in wall_points:
+                for vehicle_start, vehicle_end in vehicle_edges:
+                    distance, _nearest_vehicle = self._point_to_segment_distance(
+                        wall_point, vehicle_start, vehicle_end
+                    )
+                    if best is None or distance < best[0]:
+                        best = (distance, wall_point, wall_point, wall_point)
+        return best
+
+    def _vehicle_overlaps_wall(self, vehicle_polygon):
+        vehicle_points = np.asarray(vehicle_polygon, dtype=np.float32).reshape(-1, 2)
+        return len(vehicle_points) >= 3 and any(
+            len(wall) >= 3 and self._polygons_overlap(vehicle_points, wall)
+            for wall in self.walls
+        )
+
+    @staticmethod
+    def _segment_intersects_polygon(start, end, polygon):
+        polygon_points = np.asarray(polygon, dtype=np.int32).reshape(-1, 2)
+        if len(polygon_points) < 3:
+            return False
+        start = np.asarray(start, dtype=np.float32)
+        end = np.asarray(end, dtype=np.float32)
+        left = max(int(polygon_points[:, 0].min()), int(math.floor(min(start[0], end[0]))))
+        top = max(int(polygon_points[:, 1].min()), int(math.floor(min(start[1], end[1]))))
+        right = min(int(polygon_points[:, 0].max()), int(math.ceil(max(start[0], end[0]))))
+        bottom = min(int(polygon_points[:, 1].max()), int(math.ceil(max(start[1], end[1]))))
+        if left > right or top > bottom:
+            return False
+
+        offset = np.asarray([left, top], dtype=np.int32)
+        shape = (bottom - top + 1, right - left + 1)
+        polygon_mask = np.zeros(shape, dtype=np.uint8)
+        segment_mask = np.zeros(shape, dtype=np.uint8)
+        cv2.fillPoly(polygon_mask, [polygon_points - offset], 255)
+        segment_start = tuple(np.rint(start - offset).astype(int))
+        segment_end = tuple(np.rint(end - offset).astype(int))
+        cv2.line(segment_mask, segment_start, segment_end, 255, 1, cv2.LINE_8)
+        return cv2.countNonZero(cv2.bitwise_and(polygon_mask, segment_mask)) > 0
+
+    def _trajectory_crosses_wall(self, start, end):
+        return any(
+            len(wall) >= 3 and self._segment_intersects_polygon(start, end, wall)
+            for wall in self.walls
+        )
+
     @staticmethod
     def _polygons_overlap(first, second):
         first = np.asarray(first, dtype=np.int32).reshape(-1, 2)
@@ -2126,10 +2206,25 @@ class DriftJudgeSystem:
                         center = (int((box[0] + box[2]) / 2), int((box[1] + box[3]) / 2))
                         angle = 0
                         axis_angle = 0
+                        polygon = []
 
-                    if not self._vehicle_is_on_track(center):
-                        continue
+                    on_track = self._vehicle_is_on_track(center)
                     track_id = self._stable_track_id(track_id, center, frame_idx)
+                    previous_history = self.car_history.get(track_id, [])
+                    route_polygon = polygon if len(polygon) >= 3 else [
+                        [box[0], box[1]], [box[2], box[1]],
+                        [box[2], box[3]], [box[0], box[3]],
+                    ]
+                    route_only_crossing = (
+                        not on_track and (
+                            self._vehicle_overlaps_wall(route_polygon) or
+                            (previous_history and self._trajectory_crosses_wall(
+                                previous_history[-1][0], center
+                            ))
+                        )
+                    )
+                    if not on_track and not route_only_crossing:
+                        continue
                     self.track_last_seen[track_id] = frame_idx
                     previous_observation = self.car_last_observations.get(track_id)
                     previous_angle = (previous_observation.get("angle")
@@ -2197,8 +2292,41 @@ class DriftJudgeSystem:
                         self.car_history[track_id], box.tolist(), current_observation.get("polygon", []))
                     current_frame_metrics[track_id] = current_metrics.copy()
 
+                    if route_only_crossing:
+                        condition_samples = self.car_condition_samples[track_id]
+                        if (metrics.get("in_scoring_zone", False) and
+                                self.score_weights["route"] > 0):
+                            totals = self.car_score_totals[track_id]
+                            totals["line_score"] += metrics["line_score"]
+                            condition_samples["route"] += 1
+                            speed_average = totals["speed_score"] / max(1, condition_samples["speed"])
+                            angle_average = totals["angle_score"] / max(1, condition_samples["angle"])
+                            route_average = totals["line_score"] / condition_samples["route"]
+                            stability_average = (
+                                (totals["speed_stability_score"] + totals["angle_stability_score"]) /
+                                condition_samples["stability"]
+                                if condition_samples["stability"] > 0 else 0.0
+                            )
+                            weighted_score = (
+                                speed_average / 10.0 * 100.0 * self.score_weights["speed"] +
+                                angle_average / 20.0 * 100.0 * self.score_weights["angle"] +
+                                route_average / 40.0 * 100.0 * self.score_weights["route"] +
+                                stability_average / 30.0 * 100.0 * self.score_weights["stability"]
+                            )
+                            self.system_scores[track_id] = min(100.0, max(0.0, weighted_score))
+                            self.car_scores[track_id] = (
+                                0.0 if self.spin_crash_override.get(track_id)
+                                else self.system_scores[track_id]
+                            )
+                            self.car_details.setdefault(track_id, {}).update({
+                                "line_score": route_average,
+                                "route_ratio": metrics["route_ratio"],
+                                "wall_distance_mm": metrics["wall_distance_mm"],
+                                "crossed_wall": metrics["crossed_wall"],
+                                "in_scoring_zone": metrics["in_scoring_zone"],
+                            })
                     # 每 X 幀計算一次
-                    if frame_idx % self.sample_frames == 0:
+                    elif frame_idx % self.sample_frames == 0:
                         metrics = current_metrics
                         self.car_last_observations[track_id]["speed"] = metrics["speed"]
                         self.car_last_observations[track_id]["drift_angle"] = metrics["drift_angle"]
@@ -2529,7 +2657,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="遙控甩尾影片評分程式")
     parser.add_argument("--mode", choices=("score", "train-track", "train-track-only", "train-vehicle", "train-vehicle-only", "auto-augment", "curate-validation"), default="score",
                         help="功能模式：score 記分、train-track 跑道訓練、train-track-only 使用現有跑道資料訓練、train-vehicle 手動標記、train-vehicle-only 使用現有資料訓練、auto-augment 自動擴充資料、curate-validation 挑選驗證集")
-    parser.add_argument("--sample-frames", type=int, default=5, help="每 X 幀計算一次成績")
+    parser.add_argument("--sample-frames", type=int, default=1, help="每 X 幀計算一次成績")
     parser.add_argument("--track-interval", type=int, default=1, help="每幾幀執行一次車輛辨識")
     parser.add_argument("--track-merge-iou", type=float, default=0.35,
                         help="同車重複框的 IoU 合併門檻，越低越容易合併")
