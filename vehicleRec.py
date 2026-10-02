@@ -1082,6 +1082,9 @@ class DriftJudgeSystem:
         self.car_best_observations = {}
         self.track_color_indices = {}
         self.car_dominant_colors = {}
+        self.car_display_slots = {}  # track_id -> 固定顯示列（車輛出畫面後保留空列，不往上遞補）
+        self.car_display_labels = {}  # track_id -> 依出現順序編號的 carX 標籤，不重複使用
+        self.car_label_counter = 0
         self.video_fps = 30.0
         self.frame_diagonal = 1.0
         self.display_options = {
@@ -2388,10 +2391,27 @@ class DriftJudgeSystem:
             display_frame = cv2.resize(frame, (display_width, display_height), interpolation=cv2.INTER_AREA)
             cv2.putText(display_frame, "S-提前結算  Enter-離開", (20, 38),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-            for row, track_id in enumerate(sorted(current_frame_metrics), start=1):
+            # 車輛出畫面時釋放其顯示列，讓後面列表留空而非往上遞補；新車輛優先補進最小的空列
+            for vanished_id in [tid for tid in self.car_display_slots if tid not in current_frame_metrics]:
+                del self.car_display_slots[vanished_id]
+            occupied_slots = set(self.car_display_slots.values())
+            for track_id in sorted(current_frame_metrics):
+                if track_id not in self.car_display_slots:
+                    next_slot = 1
+                    while next_slot in occupied_slots:
+                        next_slot += 1
+                    self.car_display_slots[track_id] = next_slot
+                    occupied_slots.add(next_slot)
+                if track_id not in self.car_display_labels:
+                    self.car_label_counter += 1
+                    self.car_display_labels[track_id] = self.car_label_counter
+            route_weight = self.score_weights["route"]
+            for track_id, row in self.car_display_slots.items():
                 metrics = current_frame_metrics[track_id]
-                line = (f"car{row:02d}  速度 {metrics['speed']:.1f}  角度 {abs(round(metrics['drift_angle']))}°  "
-                        f"路線 {metrics['line_score']:.1f}")
+                weighted_route = metrics["line_score"] / 40.0 * 100.0 * route_weight
+                label = self.car_display_labels[track_id]
+                line = (f"car{label}  速度 {metrics['speed']:.1f}  角度 {abs(round(metrics['drift_angle']))}°  "
+                        f"路線 {weighted_route:.1f}")
                 cv2.putText(display_frame, line, (20, 38 + row * 34),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
             last_display_frame = display_frame.copy()
@@ -2588,66 +2608,96 @@ class DriftJudgeSystem:
             cv2.putText(summary_frame, "FINAL SCORE", summary_ui_point(36, 62),
                         cv2.FONT_HERSHEY_SIMPLEX, summary_font(1.35), (0, 255, 255),
                         summary_thickness(3), cv2.LINE_AA)
-            cv2.putText(summary_frame, "S: Spin/Crash override | R: replay | Q/ENTER: close", summary_ui_point(36, 90),
+            cv2.putText(summary_frame, "UP/DOWN: select car | S: toggle Spin/Crash | R: replay | Q/ENTER: close",
+                        summary_ui_point(36, 90),
                         cv2.FONT_HERSHEY_SIMPLEX, summary_font(0.7), (255, 255, 255),
                         summary_thickness(2), cv2.LINE_AA)
 
-            row_y = 140
-            if self.car_scores:
-                for track_id in sorted(self.car_scores):
-                    events = self.car_events.get(track_id, {"crashes": 0, "spins": 0})
-                    detail = self.car_details.get(track_id, {})
-                    summary = (f"Car {track_id}: SCORE {self.car_scores[track_id]:.1f}/100 | "
-                               f"SYSTEM {self.system_scores.get(track_id, 0.0):.1f} | "
-                               f"{'SPIN/CRASH' if self.spin_crash_override.get(track_id) else 'NORMAL'}")
-                    cv2.putText(summary_frame, summary, summary_ui_point(40, row_y),
-                                cv2.FONT_HERSHEY_SIMPLEX, summary_font(0.95), (255, 255, 255),
-                                summary_thickness(3), cv2.LINE_AA)
-                    breakdown_parts = []
-                    if self.score_weights["speed"] > 0:
-                        breakdown_parts.append(f"速度 {detail.get('speed_score', 0) / 10 * self.score_weights['speed'] * 100:.1f}")
-                    if self.score_weights["angle"] > 0:
-                        breakdown_parts.append(f"角度 {detail.get('angle_score', 0) / 20 * self.score_weights['angle'] * 100:.1f}")
-                    if self.score_weights["route"] > 0:
-                        breakdown_parts.append(f"路線 {detail.get('line_score', 0) / 40 * self.score_weights['route'] * 100:.1f}")
-                    if self.score_weights["stability"] > 0:
-                        stability = detail.get('speed_stability_score', 0) + detail.get('angle_stability_score', 0)
-                        breakdown_parts.append(f"穩定度 {stability / 30 * self.score_weights['stability'] * 100:.1f}")
-                    breakdown = "  ".join(breakdown_parts)
-                    cv2.putText(summary_frame, breakdown, summary_ui_point(40, row_y + 24),
-                                cv2.FONT_HERSHEY_SIMPLEX, summary_font(0.7), (180, 255, 180),
+            score_track_ids = sorted(self.car_scores)
+            selected_track_index = 0
+            scoreboard_background = summary_frame.copy()
+
+            def render_scoreboard():
+                rendered = scoreboard_background.copy()
+                if not score_track_ids:
+                    cv2.putText(rendered, "No vehicle was detected", summary_ui_point(40, 140),
+                                cv2.FONT_HERSHEY_SIMPLEX, summary_font(0.9), (0, 165, 255),
                                 summary_thickness(2), cv2.LINE_AA)
-                    row_y += 52
-            else:
-                cv2.putText(summary_frame, "No vehicle was detected", summary_ui_point(40, row_y),
-                            cv2.FONT_HERSHEY_SIMPLEX, summary_font(0.9), (0, 165, 255),
-                            summary_thickness(2), cv2.LINE_AA)
+                for row_index, track_id in enumerate(score_track_ids):
+                    row_y = 140 + row_index * 40
+                    if row_index == selected_track_index:
+                        cv2.rectangle(rendered, summary_ui_point(24, row_y - 25),
+                                      summary_ui_point(1500, row_y + 12), (45, 55, 55), -1)
+                    if self.spin_crash_override.get(track_id, False):
+                        row_text = f"car{row_index + 1}-SPIN/CRASH / Total:0.0"
+                        color = (0, 165, 255)
+                    else:
+                        detail = self.car_details.get(track_id, {})
+                        speed_points = (
+                            detail.get("speed_score", 0) / 10.0 * 100.0 * self.score_weights["speed"]
+                        )
+                        angle_points = (
+                            detail.get("angle_score", 0) / 20.0 * 100.0 * self.score_weights["angle"]
+                        )
+                        route_points = (
+                            detail.get("line_score", 0) / 40.0 * 100.0 * self.score_weights["route"]
+                        )
+                        row_text = (
+                            f"car{row_index + 1}-速度:{speed_points:.1f} "
+                            f"角度:{angle_points:.1f} 路線:{route_points:.1f} "
+                            f"/ Total:{self.car_scores[track_id]:.1f}"
+                        )
+                        color = (255, 255, 255)
+                    cv2.putText(rendered, row_text, summary_ui_point(40, row_y),
+                                cv2.FONT_HERSHEY_SIMPLEX, summary_font(0.8), color,
+                                summary_thickness(2), cv2.LINE_AA)
+                return cv2.resize(rendered, (display_width, display_height), interpolation=cv2.INTER_AREA)
 
             results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "score_results")
             os.makedirs(results_dir, exist_ok=True)
-            summary_frame = cv2.resize(summary_frame, (display_width, display_height), interpolation=cv2.INTER_AREA)
+            summary_frame = render_scoreboard()
             summary_path = os.path.join(results_dir, f"summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
             cv2.imwrite(summary_path, summary_frame)
             print(f"[分數畫面] 已保存: {summary_path}")
-            self._save_score_results()
             cv2.imshow(display_window, summary_frame)
             while True:
-                key = cv2.waitKey(100) & 0xFF
-                if key == ord('r'):
+                key = cv2.waitKeyEx(100)
+                key_char = key & 0xFF
+                if key in (2490368, 0x260000) and score_track_ids:
+                    selected_track_index = (selected_track_index - 1) % len(score_track_ids)
+                    summary_frame = render_scoreboard()
+                    cv2.imshow(display_window, summary_frame)
+                    cv2.imwrite(summary_path, summary_frame)
+                    continue
+                if key in (2621440, 0x280000) and score_track_ids:
+                    selected_track_index = (selected_track_index + 1) % len(score_track_ids)
+                    summary_frame = render_scoreboard()
+                    cv2.imshow(display_window, summary_frame)
+                    cv2.imwrite(summary_path, summary_frame)
+                    continue
+                if key_char == ord('r'):
+                    self._save_score_results()
                     cv2.destroyWindow(display_window)
                     self._reset_analysis_state()
                     print("[重播] 已清除上一輪分數，重新分析影片...")
                     return self.process_video()
-                if key == ord('s') and self.car_scores:
-                    for track_id in self.car_scores:
-                        self.spin_crash_override[track_id] = not self.spin_crash_override.get(track_id, False)
-                        self.car_scores[track_id] = (
-                            0.0 if self.spin_crash_override[track_id] else self.system_scores.get(track_id, 0.0)
-                        )
-                    print("[人工判定] Spin / Crash override "
-                          f"{'ON' if any(self.spin_crash_override.values()) else 'OFF'}")
-                    break
-                if key in (ord('q'), 13):
+                if key_char in (ord('s'), ord('S')) and score_track_ids:
+                    track_id = score_track_ids[selected_track_index]
+                    self.spin_crash_override[track_id] = not self.spin_crash_override.get(track_id, False)
+                    self.car_scores[track_id] = (
+                        0.0 if self.spin_crash_override[track_id]
+                        else self.system_scores.get(track_id, 0.0)
+                    )
+                    print(f"[人工判定] Car {selected_track_index + 1} / track {track_id}: "
+                          f"{'SPIN/CRASH' if self.spin_crash_override[track_id] else 'NORMAL'} | "
+                          f"score={self.car_scores[track_id]:.1f}")
+                    summary_frame = render_scoreboard()
+                    cv2.imshow(display_window, summary_frame)
+                    cv2.imwrite(summary_path, summary_frame)
+                    continue
+                if key_char in (ord('q'), 13):
+                    cv2.imwrite(summary_path, summary_frame)
+                    self._save_score_results()
                     break
 
         cv2.destroyAllWindows()
