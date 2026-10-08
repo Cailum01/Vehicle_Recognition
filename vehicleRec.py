@@ -1318,6 +1318,146 @@ class DriftJudgeSystem:
         maximize_cv_window(window_name)
         return display_width, display_height, scale
 
+        # ====================== 科技風視覺輔助函式 ======================
+    @staticmethod
+    def _draw_text(img, text, org, font_scale=0.7, color=(255, 255, 255),
+                   thickness=2, outline=True, font=cv2.FONT_HERSHEY_SIMPLEX):
+        if outline:
+            cv2.putText(img, text, org, font, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+        cv2.putText(img, text, org, font, font_scale, color, thickness, cv2.LINE_AA)
+
+    @staticmethod
+    def _draw_panel(img, x1, y1, x2, y2, alpha=0.55, color=(15, 15, 20)):
+        overlay = img.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+        cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+        cv2.rectangle(img, (x1, y1), (x2, y2), (60, 70, 90), 1, cv2.LINE_AA)
+
+    @staticmethod
+    def _draw_progress_bar(img, x, y, w, h, ratio, fg_color=(0, 220, 255), bg_color=(40, 45, 55)):
+        ratio = max(0.0, min(1.0, float(ratio)))
+        cv2.rectangle(img, (x, y), (x + w, y + h), bg_color, -1)
+        if ratio > 0:
+            cv2.rectangle(img, (x, y), (x + int(w * ratio), y + h), fg_color, -1)
+        cv2.rectangle(img, (x, y), (x + w, y + h), (80, 90, 110), 1)
+
+    def _draw_live_hud(self, display_frame, current_frame_metrics, frame_idx):
+        h, w = display_frame.shape[:2]
+
+        # 頂部狀態列
+        self._draw_panel(display_frame, 0, 0, w, 48, alpha=0.65)
+        self._draw_text(display_frame, "RC DRIFT ANALYZER", (20, 32),
+                        font_scale=0.85, color=(0, 230, 255), thickness=2)
+        self._draw_text(display_frame, f"FRAME {frame_idx}", (w // 2 - 60, 32),
+                        font_scale=0.65, color=(180, 190, 200), thickness=1)
+        self._draw_text(display_frame, "S End   Enter Exit   W/Z/B/A Toggle", (w - 380, 32),
+                        font_scale=0.55, color=(160, 170, 180), thickness=1)
+
+        # 右側車輛卡片
+        card_w, card_h = 260, 78
+        margin = 12
+        start_y = 60
+        route_weight = self.score_weights.get("route", 0.6)
+
+        for track_id, slot in sorted(self.car_display_slots.items(), key=lambda x: x[1]):
+            if track_id not in current_frame_metrics:
+                continue
+            metrics = current_frame_metrics[track_id]
+            label = self.car_display_labels.get(track_id, track_id)
+            color = self._track_annotation_color(track_id)
+
+            x1 = w - card_w - margin
+            # 用 slot 決定位置，離開的車會留下空位，不往上遞補
+            y1 = start_y + (slot - 1) * (card_h + 8)
+            x2 = w - margin
+            y2 = y1 + card_h
+
+            self._draw_panel(display_frame, x1, y1, x2, y2, alpha=0.62)
+            cv2.rectangle(display_frame, (x1, y1), (x1 + 6, y2), color, -1)
+
+            self._draw_text(display_frame, f"CAR {label}", (x1 + 16, y1 + 22),
+                            font_scale=0.65, color=(255, 255, 255), thickness=2)
+
+            speed = metrics.get("speed", 0)
+            self._draw_text(display_frame, f"{speed:.0f}", (x1 + 16, y1 + 48),
+                            font_scale=0.7, color=(0, 230, 255), thickness=2)
+            self._draw_text(display_frame, "mm/s", (x1 + 70, y1 + 48),
+                            font_scale=0.45, color=(150, 160, 170), thickness=1)
+
+            angle = abs(round(metrics.get("drift_angle", 0)))
+            self._draw_text(display_frame, f"{angle}°", (x1 + 130, y1 + 48),
+                            font_scale=0.65, color=(255, 180, 50), thickness=2)
+
+            # 路線品質：有得分區時只顯示區內，沒有得分區才顯示整段
+            if metrics.get("in_scoring_zone", True):
+                route_quality = metrics.get("route_ratio", 0.0)
+            else:
+                route_quality = 0.0
+            self._draw_progress_bar(display_frame, x1 + 16, y1 + 58, card_w - 32, 8,
+                                route_quality, fg_color=(0, 200, 120))
+
+    def _render_modern_scoreboard(self, base_frame, display_width, display_height,
+                                  score_track_ids, selected_track_index):
+        summary = base_frame.copy()
+        h, w = summary.shape[:2]
+        scale = display_width / max(1, w)
+
+        def sx(v): return int(v / max(scale, 0.01))
+        def sy(v): return int(v / max(scale, 0.01))
+        def sf(size): return max(0.35, size / max(scale, 0.01))
+        def st(size): return max(1, int(round(size / max(scale, 0.01))))
+
+        dark = np.zeros_like(summary)
+        summary = cv2.addWeighted(summary, 0.32, dark, 0.68, 0)
+
+        self._draw_panel(summary, sx(30), sy(25), sx(620), sy(110), alpha=0.7)
+        self._draw_text(summary, "FINAL SCORE", (sx(50), sy(70)),
+                        font_scale=sf(1.4), color=(0, 230, 255), thickness=st(3))
+        self._draw_text(summary, "UP/DOWN select   S Spin/Crash   R Replay   Q/ENTER close",
+                        (sx(50), sy(95)), font_scale=sf(0.55), color=(180, 190, 200), thickness=st(1))
+
+        if not score_track_ids:
+            self._draw_text(summary, "No vehicle detected", (sx(50), sy(180)),
+                            font_scale=sf(0.9), color=(0, 165, 255), thickness=st(2))
+        else:
+            card_h = 52
+            for row_index, track_id in enumerate(score_track_ids):
+                y = 140 + row_index * (card_h + 10)
+                x1, y1 = sx(30), sy(y)
+                x2, y2 = sx(920), sy(y + card_h)
+
+                is_selected = (row_index == selected_track_index)
+                panel_color = (30, 40, 55) if is_selected else (18, 20, 28)
+                self._draw_panel(summary, x1, y1, x2, y2, alpha=0.72, color=panel_color)
+
+                if is_selected:
+                    cv2.rectangle(summary, (x1, y1), (x1 + sx(6), y2), (0, 230, 255), -1)
+
+                if self.spin_crash_override.get(track_id, False):
+                    text = f"CAR {row_index + 1}   SPIN / CRASH"
+                    total = 0.0
+                    color = (0, 140, 255)
+                else:
+                    detail = self.car_details.get(track_id, {})
+                    speed_pts = detail.get("speed_score", 0) / 10.0 * 100.0 * self.score_weights["speed"]
+                    angle_pts = detail.get("angle_score", 0) / 20.0 * 100.0 * self.score_weights["angle"]
+                    route_pts = detail.get("line_score", 0) / 40.0 * 100.0 * self.score_weights["route"]
+                    total = self.car_scores.get(track_id, 0.0)
+                    text = (f"CAR {row_index + 1}   "
+                            f"SPD {speed_pts:.1f}   ANG {angle_pts:.1f}   RTE {route_pts:.1f}")
+                    color = (255, 255, 255)
+
+                self._draw_text(summary, text, (sx(50), sy(y + 32)),
+                                font_scale=sf(0.75), color=color, thickness=st(2))
+                self._draw_text(summary, f"{total:.1f}", (sx(780), sy(y + 34)),
+                                font_scale=sf(0.95), color=(0, 230, 255), thickness=st(2))
+
+        self._draw_panel(summary, 0, h - sy(50), w, h, alpha=0.7)
+        self._draw_text(summary, "Select vehicle with arrow keys  |  S toggle Spin/Crash  |  R replay analysis  |  Enter / Q to finish",
+                        (sx(40), h - sy(18)), font_scale=sf(0.55), color=(170, 180, 190), thickness=st(1))
+
+        return cv2.resize(summary, (display_width, display_height), interpolation=cv2.INTER_AREA)
+
     def _apply_nearest_track_sample(self, frame):
         """以目前影片第一幀找最接近的手繪樣張，套用其跑道 polygon。"""
         image_dir = os.path.join(self.training_root, "images", "train")
@@ -2115,22 +2255,6 @@ class DriftJudgeSystem:
         current_angle += 180.0 * round((previous_angle - current_angle) / 180.0)
         return current_angle
 
-    @staticmethod
-    def _orient_axis_to_motion(axis_angle, motion_vector, minimum_motion):
-        """用明確的移動方向決定車身軸線尚未判定的 180 度極性。"""
-        dx, dy = float(motion_vector[0]), float(motion_vector[1])
-        distance = math.hypot(dx, dy)
-        if distance < minimum_motion:
-            return float(axis_angle), False
-
-        angle_radians = math.radians(float(axis_angle))
-        projection = math.cos(angle_radians) * dx + math.sin(angle_radians) * dy
-        if abs(projection) < distance * 0.25:
-            return float(axis_angle), False
-        if projection < 0:
-            axis_angle = float(axis_angle) + 180.0
-        return float(axis_angle), True
-
     def process_video(self):
         """執行比賽動態追蹤與判分"""
         cap = cv2.VideoCapture(self.video_path)
@@ -2249,26 +2373,10 @@ class DriftJudgeSystem:
                     previous_angle = (previous_observation.get("angle")
                                       if previous_observation else None)
                     axis_angle = self._continuous_axis_angle(previous_angle, axis_angle)
-                    axis_direction_resolved = bool(
-                        previous_observation and
-                        previous_observation.get("axis_direction_resolved", False)
-                    )
-                    if not axis_direction_resolved and previous_history:
-                        motion_start = previous_history[max(0, len(previous_history) - 4)][0]
-                        minimum_motion = max(
-                            2.0,
-                            max(box[2] - box[0], box[3] - box[1]) * 0.05,
-                        )
-                        axis_angle, axis_direction_resolved = self._orient_axis_to_motion(
-                            axis_angle,
-                            (center[0] - motion_start[0], center[1] - motion_start[1]),
-                            minimum_motion,
-                        )
 
                     self.car_last_observations[track_id] = {
                         "center": [int(center[0]), int(center[1])],
                         "angle": round(float(axis_angle), 1),
-                        "axis_direction_resolved": axis_direction_resolved,
                         "confidence": round(float(confidences[i]), 4),
                         "bbox": [int(value) for value in box],
                         "polygon": masks[i].astype(int).tolist() if i < len(masks) else [],
@@ -2421,9 +2529,8 @@ class DriftJudgeSystem:
                         cv2.circle(frame, center, 4, (0, 0, 255), -1)
 
             display_frame = cv2.resize(frame, (display_width, display_height), interpolation=cv2.INTER_AREA)
-            cv2.putText(display_frame, "S-提前結算  Enter-離開", (20, 38),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-            # 車輛出畫面時釋放其顯示列，讓後面列表留空而非往上遞補；新車輛優先補進最小的空列
+
+            # 車輛出畫面時釋放其顯示列
             for vanished_id in [tid for tid in self.car_display_slots if tid not in current_frame_metrics]:
                 del self.car_display_slots[vanished_id]
             occupied_slots = set(self.car_display_slots.values())
@@ -2437,17 +2544,13 @@ class DriftJudgeSystem:
                 if track_id not in self.car_display_labels:
                     self.car_label_counter += 1
                     self.car_display_labels[track_id] = self.car_label_counter
-            route_weight = self.score_weights["route"]
-            for track_id, row in self.car_display_slots.items():
-                metrics = current_frame_metrics[track_id]
-                weighted_route = metrics["line_score"] / 40.0 * 100.0 * route_weight
-                label = self.car_display_labels[track_id]
-                line = (f"car{label}  速度 {metrics['speed']:.1f}  角度 {abs(round(metrics['drift_angle']))}°  "
-                        f"路線 {weighted_route:.1f}")
-                cv2.putText(display_frame, line, (20, 38 + row * 34),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+
+            # 科技風 HUD
+            self._draw_live_hud(display_frame, current_frame_metrics, frame_idx)
+
             last_display_frame = display_frame.copy()
             cv2.imshow(display_window, display_frame)
+
             target_time = playback_start + max(0, frame_idx - 1) / self.video_fps
             wait_ms = max(1, int((target_time - time.perf_counter()) * 1000))
             key = cv2.waitKey(wait_ms) & 0xFF
@@ -2649,59 +2752,31 @@ class DriftJudgeSystem:
             selected_track_index = 0
             scoreboard_background = summary_frame.copy()
 
-            def render_scoreboard():
-                rendered = scoreboard_background.copy()
-                if not score_track_ids:
-                    cv2.putText(rendered, "No vehicle was detected", summary_ui_point(40, 140),
-                                cv2.FONT_HERSHEY_SIMPLEX, summary_font(0.9), (0, 165, 255),
-                                summary_thickness(2), cv2.LINE_AA)
-                for row_index, track_id in enumerate(score_track_ids):
-                    row_y = 140 + row_index * 40
-                    if row_index == selected_track_index:
-                        cv2.rectangle(rendered, summary_ui_point(24, row_y - 25),
-                                      summary_ui_point(1500, row_y + 12), (45, 55, 55), -1)
-                    if self.spin_crash_override.get(track_id, False):
-                        row_text = f"car{row_index + 1}-SPIN/CRASH / Total:0.0"
-                        color = (0, 165, 255)
-                    else:
-                        detail = self.car_details.get(track_id, {})
-                        speed_points = (
-                            detail.get("speed_score", 0) / 10.0 * 100.0 * self.score_weights["speed"]
-                        )
-                        angle_points = (
-                            detail.get("angle_score", 0) / 20.0 * 100.0 * self.score_weights["angle"]
-                        )
-                        route_points = (
-                            detail.get("line_score", 0) / 40.0 * 100.0 * self.score_weights["route"]
-                        )
-                        row_text = (
-                            f"car{row_index + 1}-速度:{speed_points:.1f} "
-                            f"角度:{angle_points:.1f} 路線:{route_points:.1f} "
-                            f"/ Total:{self.car_scores[track_id]:.1f}"
-                        )
-                        color = (255, 255, 255)
-                    cv2.putText(rendered, row_text, summary_ui_point(40, row_y),
-                                cv2.FONT_HERSHEY_SIMPLEX, summary_font(0.8), color,
-                                summary_thickness(2), cv2.LINE_AA)
-                return cv2.resize(rendered, (display_width, display_height), interpolation=cv2.INTER_AREA)
-
             results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "score_results")
             os.makedirs(results_dir, exist_ok=True)
-            summary_frame = render_scoreboard()
             summary_path = os.path.join(results_dir, f"summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
+
+            def render_scoreboard():
+                return self._render_modern_scoreboard(
+                    scoreboard_background, display_width, display_height,
+                    score_track_ids, selected_track_index
+                )
+
+            summary_frame = render_scoreboard()
             cv2.imwrite(summary_path, summary_frame)
             print(f"[分數畫面] 已保存: {summary_path}")
             cv2.imshow(display_window, summary_frame)
+
             while True:
                 key = cv2.waitKeyEx(100)
                 key_char = key & 0xFF
-                if key in (2490368, 0x260000) and score_track_ids:
+                if key in (2490368, 0x260000) and score_track_ids:          # UP
                     selected_track_index = (selected_track_index - 1) % len(score_track_ids)
                     summary_frame = render_scoreboard()
                     cv2.imshow(display_window, summary_frame)
                     cv2.imwrite(summary_path, summary_frame)
                     continue
-                if key in (2621440, 0x280000) and score_track_ids:
+                if key in (2621440, 0x280000) and score_track_ids:          # DOWN
                     selected_track_index = (selected_track_index + 1) % len(score_track_ids)
                     summary_frame = render_scoreboard()
                     cv2.imshow(display_window, summary_frame)
