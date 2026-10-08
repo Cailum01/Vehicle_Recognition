@@ -248,7 +248,7 @@ def auto_augment_vehicle_data(video_paths, epochs=50, sample_every=10, min_conf=
     elif os.path.isfile(trained_model):
         model_path = trained_model
     else:
-        model_path = "yolov8n-seg.pt"
+        model_path = "yolo11n-seg.pt"
     print(f"[自動擴充] 使用模型: {model_path} | conf={min_conf}")
     model = YOLO(model_path)
     added_count = 0
@@ -953,7 +953,7 @@ def _train_track_model(training_root, track_model_path, epochs=20):
     with open(yaml_path, "w", encoding="utf-8") as yaml_file:
         yaml_file.write(yaml_content)
 
-    base_model = track_model_path if os.path.exists(track_model_path) else "yolov8n-seg.pt"
+    base_model = track_model_path if os.path.exists(track_model_path) else "yolo11n-seg.pt"
     print(f"[跑道訓練] 使用 {sample_count} 個既有樣本訓練 {epochs} epochs...")
     model = YOLO(base_model)
     model.train(data=yaml_path, epochs=epochs, imgsz=640, batch=16, workers=0,
@@ -1003,7 +1003,7 @@ def _train_vehicle_model(dataset_dir, epochs):
         yaml_file.write(f"path: {dataset_dir.replace(os.sep, '/')}\ntrain: images/train\nval: images/val\nnames:\n  0: RC_Car\n")
 
     print(f"[車輛訓練] 使用 {image_count} 張圖片訓練 {epochs} epochs...")
-    model = YOLO("yolov8n-seg.pt")
+    model = YOLO("yolo11n-seg.pt")
     model.train(data=yaml_path, epochs=epochs, imgsz=640, batch=4, workers=0,
                 patience=30, project=dataset_dir, name="runs_latest", exist_ok=True)
     best_model = os.path.join(dataset_dir, "runs_latest", "weights", "best.pt")
@@ -1017,7 +1017,7 @@ def _train_vehicle_model(dataset_dir, epochs):
 
 class DriftJudgeSystem:
     def __init__(self, video_path, track_model_path="track_seg_model.pt", sample_frames=5,
-                 track_interval=1, enable_learning=False, car_model_path="yolov8n-seg.pt",
+                 track_interval=1, enable_learning=False, car_model_path="yolo11n-seg.pt",
                  vehicle_class=2, track_merge_iou=0.35,
                  track_merge_center_ratio=0.55, track_merge_min_distance=30.0,
                  track_merge_containment=0.65):
@@ -1055,7 +1055,7 @@ class DriftJudgeSystem:
         self.training_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "track_training")
         self.zones_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "track_zones.json")
         
-        # 1. 載入車輛追蹤模型 (YOLOv8 Segmentation)
+        # 1. 載入車輛追蹤模型 (YOLO11 Segmentation)
         self.car_model = YOLO(car_model_path)
         
         # 賽道資訊設定 [(x1,y1), (x2,y2)...]
@@ -2115,6 +2115,22 @@ class DriftJudgeSystem:
         current_angle += 180.0 * round((previous_angle - current_angle) / 180.0)
         return current_angle
 
+    @staticmethod
+    def _orient_axis_to_motion(axis_angle, motion_vector, minimum_motion):
+        """用明確的移動方向決定車身軸線尚未判定的 180 度極性。"""
+        dx, dy = float(motion_vector[0]), float(motion_vector[1])
+        distance = math.hypot(dx, dy)
+        if distance < minimum_motion:
+            return float(axis_angle), False
+
+        angle_radians = math.radians(float(axis_angle))
+        projection = math.cos(angle_radians) * dx + math.sin(angle_radians) * dy
+        if abs(projection) < distance * 0.25:
+            return float(axis_angle), False
+        if projection < 0:
+            axis_angle = float(axis_angle) + 180.0
+        return float(axis_angle), True
+
     def process_video(self):
         """執行比賽動態追蹤與判分"""
         cap = cv2.VideoCapture(self.video_path)
@@ -2233,10 +2249,26 @@ class DriftJudgeSystem:
                     previous_angle = (previous_observation.get("angle")
                                       if previous_observation else None)
                     axis_angle = self._continuous_axis_angle(previous_angle, axis_angle)
+                    axis_direction_resolved = bool(
+                        previous_observation and
+                        previous_observation.get("axis_direction_resolved", False)
+                    )
+                    if not axis_direction_resolved and previous_history:
+                        motion_start = previous_history[max(0, len(previous_history) - 4)][0]
+                        minimum_motion = max(
+                            2.0,
+                            max(box[2] - box[0], box[3] - box[1]) * 0.05,
+                        )
+                        axis_angle, axis_direction_resolved = self._orient_axis_to_motion(
+                            axis_angle,
+                            (center[0] - motion_start[0], center[1] - motion_start[1]),
+                            minimum_motion,
+                        )
 
                     self.car_last_observations[track_id] = {
                         "center": [int(center[0]), int(center[1])],
                         "angle": round(float(axis_angle), 1),
+                        "axis_direction_resolved": axis_direction_resolved,
                         "confidence": round(float(confidences[i]), 4),
                         "bbox": [int(value) for value in box],
                         "polygon": masks[i].astype(int).tolist() if i < len(masks) else [],
@@ -2897,7 +2929,7 @@ if __name__ == "__main__":
 
     trained_car_model = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rc_car_model.pt")
     use_trained_model = os.path.exists(trained_car_model)
-    car_model_path = args.car_model or (trained_car_model if use_trained_model else "yolov8n-seg.pt")
+    car_model_path = args.car_model or (trained_car_model if use_trained_model else "yolo11n-seg.pt")
 
     # 強制使用自訂遙控車模型時，class ID 必須為 0；否則 YOLO 會查找錯誤類別並直接漏檢
     vehicle_class = 0 if (use_trained_model or args.car_model is not None) else args.vehicle_class

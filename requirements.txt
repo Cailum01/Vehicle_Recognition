@@ -1,0 +1,7 @@
+# 電腦視覺與 AI 模型
+opencv-python>=4.8.0
+ultralytics>=8.0.0
+numpy>=1.24.0
+
+# 備註：以下為 Python 標準庫 (Standard Libraries)，已內建無需安裝：
+# argparse, ctypes, math, os, json, re, shutil, sys, time, datetime, tkinter
