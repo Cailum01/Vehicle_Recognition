@@ -1350,7 +1350,7 @@ class DriftJudgeSystem:
                         font_scale=0.85, color=(0, 230, 255), thickness=2)
         self._draw_text(display_frame, f"FRAME {frame_idx}", (w // 2 - 60, 32),
                         font_scale=0.65, color=(180, 190, 200), thickness=1)
-        self._draw_text(display_frame, "S End   Enter Exit   W/Z/B/A Toggle", (w - 380, 32),
+        self._draw_text(display_frame, "S End   Enter Exit   W/Z/B/A/H Toggle", (w - 380, 32),
                         font_scale=0.55, color=(160, 170, 180), thickness=1)
 
         # 右側車輛卡片
@@ -1379,14 +1379,40 @@ class DriftJudgeSystem:
                             font_scale=0.65, color=(255, 255, 255), thickness=2)
 
             speed = metrics.get("speed", 0)
-            self._draw_text(display_frame, f"{speed:.0f}", (x1 + 16, y1 + 48),
-                            font_scale=0.7, color=(0, 230, 255), thickness=2)
-            self._draw_text(display_frame, "mm/s", (x1 + 70, y1 + 48),
+            speed_text = f"{speed:.0f}"
+            unit_text = "mm/s"
+            speed_origin_x = x1 + 16
+            unit_font_scale = 0.45
+            unit_size = cv2.getTextSize(
+                unit_text, cv2.FONT_HERSHEY_SIMPLEX, unit_font_scale, 1
+            )[0]
+            angle = abs(round(metrics.get("drift_angle", 0)))
+            angle_text = f"{angle}°"
+            angle_font_scale = 0.65
+            angle_size = cv2.getTextSize(
+                angle_text, cv2.FONT_HERSHEY_SIMPLEX, angle_font_scale, 2
+            )[0]
+            angle_origin_x = x2 - 16 - angle_size[0]
+            speed_available_width = max(
+                1, angle_origin_x - speed_origin_x - unit_size[0] - 16
+            )
+            speed_size = cv2.getTextSize(
+                speed_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
+            )[0]
+            speed_font_scale = min(
+                0.7,
+                0.7 * speed_available_width / max(1, speed_size[0]),
+            )
+            speed_size = cv2.getTextSize(
+                speed_text, cv2.FONT_HERSHEY_SIMPLEX, speed_font_scale, 2
+            )[0]
+            self._draw_text(display_frame, speed_text, (speed_origin_x, y1 + 48),
+                            font_scale=speed_font_scale, color=(0, 230, 255), thickness=2)
+            self._draw_text(display_frame, unit_text, (speed_origin_x + speed_size[0] + 8, y1 + 48),
                             font_scale=0.45, color=(150, 160, 170), thickness=1)
 
-            angle = abs(round(metrics.get("drift_angle", 0)))
-            self._draw_text(display_frame, f"{angle}°", (x1 + 130, y1 + 48),
-                            font_scale=0.65, color=(255, 180, 50), thickness=2)
+            self._draw_text(display_frame, angle_text, (angle_origin_x, y1 + 48),
+                            font_scale=angle_font_scale, color=(255, 180, 50), thickness=2)
 
             # 路線品質：有得分區時只顯示區內，沒有得分區才顯示整段
             if metrics.get("in_scoring_zone", True):
@@ -1656,61 +1682,77 @@ class DriftJudgeSystem:
 
         while True:
             display = frame.copy()
+            overlay = display.copy()
 
-            # 繪製護欄 (紅色) 與 得分區 (綠色)
-            for w in self.walls:
-                cv2.polylines(display, [np.array(w, dtype=np.int32)], True, (0, 0, 255), 2)
-                cv2.fillPoly(display, [np.array(w, dtype=np.int32)], (0, 0, 100))
-                wall_center = np.mean(np.array(w, dtype=np.float32), axis=0).astype(int)
-                cv2.putText(display, "WALL / 護欄", tuple(wall_center),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+            # ----- 護欄（紅色半透明） -----
+            for idx, w in enumerate(self.walls, start=1):
+                polygon = np.array(w, dtype=np.int32)
+                cv2.fillPoly(overlay, [polygon], (40, 40, 180))
+                cv2.polylines(display, [polygon], True, (0, 60, 255), 3, cv2.LINE_AA)
+                center = np.mean(polygon, axis=0).astype(int)
+                self._draw_text(display, f"WALL {idx}", tuple(center),
+                                font_scale=0.7, color=(0, 80, 255), thickness=2)
 
-            for c in self.clip_zones:
-                cv2.polylines(display, [np.array(c, dtype=np.int32)], True, (0, 255, 0), 2)
-                cv2.fillPoly(display, [np.array(c, dtype=np.int32)], (0, 100, 0))
-                clip_center = np.mean(np.array(c, dtype=np.float32), axis=0).astype(int)
-                cv2.putText(display, "CLIP ZONE / 得分區", tuple(clip_center),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+            # ----- 得分區（綠色半透明） -----
+            for idx, c in enumerate(self.clip_zones, start=1):
+                polygon = np.array(c, dtype=np.int32)
+                cv2.fillPoly(overlay, [polygon], (40, 160, 60))
+                cv2.polylines(display, [polygon], True, (0, 255, 100), 3, cv2.LINE_AA)
+                center = np.mean(polygon, axis=0).astype(int)
+                self._draw_text(display, f"CLIP {idx}", tuple(center),
+                                font_scale=0.7, color=(0, 255, 120), thickness=2)
 
+            cv2.addWeighted(overlay, 0.28, display, 0.72, 0, display)
+
+            # ----- 起始方向 -----
             if self.start_direction and len(self.start_direction) == 4:
                 start = tuple(self.start_direction[:2])
                 end = tuple(self.start_direction[2:])
-                cv2.arrowedLine(display, start, end, (255, 0, 255), 5, cv2.LINE_AA, tipLength=0.25)
-                cv2.putText(display, "START DIRECTION / 起始方向", start,
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2, cv2.LINE_AA)
+                cv2.arrowedLine(display, start, end, (0, 0, 0), 8, cv2.LINE_AA, tipLength=0.25)
+                cv2.arrowedLine(display, start, end, (255, 80, 255), 4, cv2.LINE_AA, tipLength=0.25)
+                self._draw_text(display, "START", (start[0] + 12, start[1] - 12),
+                                font_scale=0.7, color=(255, 100, 255), thickness=2)
 
-            # 繪製手動標註中之點位 (黃色)
+            # ----- 目前正在畫的 polygon（青色） -----
             if len(current_pts) > 0:
-                cv2.polylines(display, [np.array(current_pts)], False, (0, 255, 255), 2)
+                pts = np.array(current_pts, dtype=np.int32)
+                cv2.polylines(display, [pts], False, (0, 255, 255), 2, cv2.LINE_AA)
                 for pt in current_pts:
-                    cv2.circle(display, pt, 4, (0, 255, 255), -1)
+                    cv2.circle(display, pt, 6, (0, 0, 0), -1, cv2.LINE_AA)
+                    cv2.circle(display, pt, 4, (0, 255, 255), -1, cv2.LINE_AA)
 
+            # ----- 縮放後的顯示畫面 -----
             display_frame = cv2.resize(display, (display_width, display_height), interpolation=cv2.INTER_AREA)
+            dh, dw = display_frame.shape[:2]
+
+            # ----- 頂部狀態列 -----
+            self._draw_panel(display_frame, 0, 0, dw, 52, alpha=0.72)
             status_source = "AUTO DETECTED" if auto_success and not is_manual_mode else "MANUAL DRAWING"
-            mode_label = "DRAWING WALL / 護欄" if mode == "WALL" else "DRAWING CLIP ZONE / 得分區"
+            mode_label = "WALL" if mode == "WALL" else "CLIP ZONE"
             direction_status = "SET" if self.start_direction else "NOT SET"
-            status_text = (f"{status_source} | {mode_label} | Walls: {len(self.walls)} | "
-                           f"Clips: {len(self.clip_zones)} | Start: {direction_status}")
-            status_color = (0, 255, 0) if auto_success and not is_manual_mode else (0, 255, 255)
-            cv2.putText(display_frame, status_text, (20, 38),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2, cv2.LINE_AA)
+            status_color = (0, 230, 120) if auto_success and not is_manual_mode else (0, 220, 255)
 
-            if auto_success:
-                auto_message = "AUTO RESULT: review zones, W/Z save, ENTER accept, Q cancel"
-            else:
-                auto_message = "MANUAL: W wall | Z clip | C cancel current | R clear all"
-            cv2.putText(display_frame, auto_message, (20, 70),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
+            self._draw_text(display_frame, "TRACK SETUP", (16, 34),
+                            font_scale=0.80, color=(0, 230, 255), thickness=2)
+            self._draw_text(
+                display_frame,
+                f"{status_source}  |  Mode: {mode_label}  |  Walls: {len(self.walls)}  Clips: {len(self.clip_zones)}  |  Start: {direction_status}",
+                (200, 34), font_scale=0.52, color=status_color, thickness=1
+            )
 
-            instructions = [
-                "LEFT CLICK: add point   RIGHT CLICK x2: start direction   W: Wall   Z: Clip",
-                "1/2: type   U: undo   I: clear direction   C: cancel   R: clear all   ENTER: accept"
-            ]
-            panel_top = max(0, display_height - 88)
-            cv2.rectangle(display_frame, (10, panel_top), (display_width - 10, display_height - 10), (0, 0, 0), -1)
-            for index, instruction in enumerate(instructions):
-                cv2.putText(display_frame, instruction, (22, panel_top + 30 + index * 28),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+            # ----- 底部快捷鍵列 -----
+            self._draw_panel(display_frame, 0, dh - 78, dw, dh, alpha=0.78)
+            self._draw_text(
+                display_frame,
+                "LEFT: add point    RIGHT x2: start direction    W: save Wall    Z: save Clip",
+                (16, dh - 48), font_scale=0.52, color=(220, 230, 240), thickness=1
+            )
+            self._draw_text(
+                display_frame,
+                "1/2: type    U: undo    C: cancel poly    R: clear all    I: clear direction    ENTER: accept    Q: exit",
+                (16, dh - 18), font_scale=0.52, color=(170, 180, 190), thickness=1
+            )
+
             cv2.imshow(setup_window, display_frame)
 
             key = cv2.waitKey(20) & 0xFF
@@ -2688,7 +2730,7 @@ class DriftJudgeSystem:
                 cv2.polylines(summary_frame, [trajectory], False, (255, 255, 255), summary_thickness(8), cv2.LINE_AA)
                 cv2.polylines(summary_frame, [trajectory], False, track_color, summary_thickness(5), cv2.LINE_AA)
                 label_step = max(1, len(history) // 8)
-                # 前後五筆追蹤資料不畫逐幀角度線，避免起步與結束時的方向不穩定。
+                # 前後n筆追蹤資料不畫逐幀角度線，避免起步與結束時的方向不穩定。
                 for point_index in range(5, max(5, len(history) - 5), label_step):
                     previous = history[point_index - 1]
                     current = history[point_index]
