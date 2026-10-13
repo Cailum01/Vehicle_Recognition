@@ -91,23 +91,27 @@ def screen_size():
     return 1920, 1080
 
 
-def select_video_file():
+def select_video_file(parent=None):
     """開啟原生系統檔案選擇器，讓使用者自由選擇影片"""
-    # 建立隱藏的 Tkinter 根視窗，避免彈出空白背景框
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes('-topmost', True)  # 強制讓檔案選擇器出現在最前面
+    owns_root = parent is None
+    root = tk.Tk() if owns_root else parent
+    if owns_root:
+        root.withdraw()
+        root.attributes('-topmost', True)  # 強制讓檔案選擇器出現在最前面
 
     print("請在彈出的視窗中選擇要匯入的遙控甩尾影片...")
-    file_path = filedialog.askopenfilename(
-        title="選擇遙控甩尾車影片",
-        filetypes=[
-            ("影片檔案", "*.mp4 *.avi *.mov *.mkv *.wmv"),
-            ("所有檔案", "*.*")
-        ]
-    )
-    
-    root.destroy()
+    try:
+        file_path = filedialog.askopenfilename(
+            parent=root,
+            title="Select RC Drift Video",
+            filetypes=[
+                ("Video Files", "*.mp4 *.avi *.mov *.mkv *.wmv"),
+                ("All Files", "*.*")
+            ]
+        )
+    finally:
+        if owns_root:
+            root.destroy()
     return file_path
 
 
@@ -2954,6 +2958,10 @@ class DriftJudgeSystem:
 
             while True:
                 key = cv2.waitKeyEx(100)
+                if cv2.getWindowProperty(display_window, cv2.WND_PROP_VISIBLE) == 0:
+                    cv2.imwrite(summary_path, summary_frame)
+                    self._save_score_results()
+                    break
                 key_char = key & 0xFF
                 if key in (2490368, 0x260000) and score_track_ids:          # UP
                     selected_track_index = (selected_track_index - 1) % len(score_track_ids)
@@ -2968,7 +2976,6 @@ class DriftJudgeSystem:
                     cv2.imwrite(summary_path, summary_frame)
                     continue
                 if key_char == ord('r'):
-                    self._save_score_results()
                     cv2.destroyWindow(display_window)
                     self._reset_analysis_state()
                     print("[重播] 已清除上一輪分數，重新分析影片...")
@@ -2994,6 +3001,182 @@ class DriftJudgeSystem:
 
         cv2.destroyAllWindows()
         print("影片分析結束，已顯示最終分數。")
+
+
+def _run_video_mode(args, selected_mode, video_path):
+    print(f"[已匯入影片]: {video_path}")
+
+    if selected_mode == "train-vehicle":
+        collect_vehicle_training_data(video_path, args.vehicle_epochs, args.vehicle_sample_frames,
+                                      train_after_save=args.enable_learning)
+        return
+
+    trained_car_model = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rc_car_model.pt")
+    use_trained_model = os.path.exists(trained_car_model)
+    car_model_path = args.car_model or (trained_car_model if use_trained_model else "yolo11n-seg.pt")
+
+    # 強制使用自訂遙控車模型時，class ID 必須為 0；否則 YOLO 會查找錯誤類別並直接漏檢
+    vehicle_class = 0 if (use_trained_model or args.car_model is not None) else args.vehicle_class
+    if use_trained_model:
+        print(f"[車輛模型] 使用已訓練模型: {trained_car_model}")
+        print(f"[車輛模型] 強制 class_id = {vehicle_class}")
+
+    merge_values = (
+        args.track_merge_iou,
+        args.track_merge_center_ratio,
+        args.track_merge_containment,
+    )
+    if any(value < 0 or value > 1 for value in merge_values) or args.track_merge_min_distance < 0:
+        print("[錯誤] 追蹤合併參數範圍無效：比例需介於 0 與 1，距離不可小於 0。")
+        return
+
+    analyzer = DriftJudgeSystem(
+        video_path=video_path,
+        track_model_path=args.track_model,
+        sample_frames=args.sample_frames,
+        speed_window_frames=args.speed_window_frames,
+        track_interval=args.track_interval,
+        track_merge_iou=args.track_merge_iou,
+        track_merge_center_ratio=args.track_merge_center_ratio,
+        track_merge_min_distance=args.track_merge_min_distance,
+        track_merge_containment=args.track_merge_containment,
+        enable_learning=args.enable_learning or selected_mode == "train-track",
+        car_model_path=car_model_path,
+        vehicle_class=vehicle_class
+    )
+
+    try:
+        if analyzer.setup_zones_interactive():
+            if selected_mode == "score":
+                analyzer.process_video()
+            else:
+                print("[跑道訓練] 標註完成；按 Enter 接受手繪結果後，會保存並訓練跑道模型。")
+    except KeyboardInterrupt:
+        cv2.destroyAllWindows()
+        print("\n[系統] 使用者中止分析，程式已安全結束。")
+
+
+def _run_score_interface(args):
+    merge_values = (
+        args.track_merge_iou,
+        args.track_merge_center_ratio,
+        args.track_merge_containment,
+    )
+    if any(value < 0 or value > 1 for value in merge_values) or args.track_merge_min_distance < 0:
+        print("[錯誤] 追蹤合併參數範圍無效：比例需介於 0 與 1，距離不可小於 0。")
+        return False
+
+    root = tk.Tk()
+    root.title("DRIFT / SCORE")
+    root.configure(bg="#07111f")
+    root.attributes("-fullscreen", True)
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    root.bind("<Escape>", lambda _event: root.destroy())
+
+    canvas = tk.Canvas(root, bg="#07111f", highlightthickness=0)
+    canvas.pack(fill="both", expand=True)
+
+    panel = tk.Frame(root, bg="#0b1928", highlightbackground="#16d9e5",
+                     highlightthickness=1, padx=52, pady=42)
+    tk.Label(panel, text="DRIFT / SCORE", bg="#0b1928", fg="#4de8f2",
+             font=("Segoe UI", 34, "bold")).pack()
+    tk.Label(panel, text="RC VEHICLE TELEMETRY SYSTEM", bg="#0b1928", fg="#83a9bd",
+             font=("Segoe UI", 11, "bold")).pack(pady=(7, 30))
+    tk.Frame(panel, bg="#1b3d50", height=1).pack(fill="x", pady=(0, 26))
+
+    status_label = tk.Label(panel, text="SYSTEM READY  /  READY TO SCORE",
+                            bg="#0b1928", fg="#b6d5e2", font=("Segoe UI", 12))
+    status_label.pack(pady=(0, 26))
+
+    button_row = tk.Frame(panel, bg="#0b1928")
+    button_row.pack()
+    start_button = tk.Button(
+        button_row, text="START SCORING", command=lambda: start_scoring(),
+        bg="#08a8b7", fg="#04111b", activebackground="#4de8f2",
+        activeforeground="#04111b", relief="flat", borderwidth=0,
+        font=("Segoe UI", 16, "bold"), width=15, height=2, cursor="hand2"
+    )
+    start_button.pack(side="left", padx=8)
+    tk.Button(
+        button_row, text="EXIT", command=root.destroy,
+        bg="#172b3b", fg="#d3e4ec", activebackground="#29485d",
+        activeforeground="#ffffff", relief="flat", borderwidth=0,
+        font=("Segoe UI", 16, "bold"), width=10, height=2, cursor="hand2"
+    ).pack(side="left", padx=8)
+    footer_label = tk.Label(
+        panel, text="LIVE SCORING  •  TRACK ANALYSIS  •  SESSION RESULTS",
+        bg="#0b1928", fg="#55758a", font=("Segoe UI", 9)
+    )
+    footer_label.pack(pady=(32, 0))
+
+    panel_window = canvas.create_window(0, 0, window=panel, tags="panel")
+
+    def draw_background(event):
+        width, height = event.width, event.height
+        canvas.delete("background")
+        canvas.create_rectangle(0, 0, width, height, fill="#07111f",
+                                outline="", tags="background")
+        for x in range(0, width, 48):
+            canvas.create_line(x, 0, x, height, fill="#102435",
+                               tags="background")
+        for y in range(0, height, 48):
+            canvas.create_line(0, y, width, y, fill="#102435",
+                               tags="background")
+        for x in range(0, width, 192):
+            canvas.create_line(x, 0, x, height, fill="#173346",
+                               tags="background")
+        for y in range(0, height, 192):
+            canvas.create_line(0, y, width, y, fill="#173346",
+                               tags="background")
+
+        center_x, center_y = int(width * 0.82), int(height * 0.48)
+        for radius in (90, 150, 220, 300):
+            canvas.create_oval(center_x - radius, center_y - radius,
+                               center_x + radius, center_y + radius,
+                               outline="#12394a", width=1, tags="background")
+        canvas.create_line(center_x - 330, center_y, center_x + 330, center_y,
+                           fill="#164354", tags="background")
+        canvas.create_line(center_x, center_y - 330, center_x, center_y + 330,
+                           fill="#164354", tags="background")
+        canvas.create_rectangle(28, 28, width - 28, height - 28,
+                               outline="#1d5969", width=1, tags="background")
+        canvas.create_text(48, 46, anchor="nw", text="SYSTEM  //  01",
+                           fill="#52cbd6", font=("Consolas", 10, "bold"),
+                           tags="background")
+        canvas.create_text(width - 48, height - 44, anchor="se",
+                           text="DRIFT JUDGE  •  READY",
+                           fill="#52cbd6", font=("Consolas", 10, "bold"),
+                           tags="background")
+        canvas.coords(panel_window, width / 2, height / 2)
+        canvas.tag_lower("background")
+
+    canvas.bind("<Configure>", draw_background)
+
+    def start_scoring():
+        start_button.configure(state="disabled")
+        button_row.pack_forget()
+        status_label.configure(text="PROCESSING  /  SCORING IN PROGRESS...")
+        root.update_idletasks()
+        try:
+            video_path = select_video_file(parent=root)
+            if not video_path:
+                return
+            _run_video_mode(args, "score", video_path)
+        except KeyboardInterrupt:
+            cv2.destroyAllWindows()
+            print("\n[系統] 使用者中止分析，返回評分主介面。")
+        finally:
+            if root.winfo_exists():
+                root.deiconify()
+                root.attributes("-fullscreen", True)
+                root.lift()
+                status_label.configure(text="SYSTEM READY  /  READY TO SCORE")
+                button_row.pack(before=footer_label)
+                start_button.configure(state="normal")
+
+    root.mainloop()
+    return True
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="遙控甩尾影片評分程式")
@@ -3177,62 +3360,15 @@ if __name__ == "__main__":
             print("\n[自動擴充] 已按 Ctrl+C，停止循環。")
         sys.exit()
 
+    if selected_mode == "score":
+        if not _run_score_interface(args):
+            sys.exit(1)
+        sys.exit()
+
     # 匯入影片：透過 UI 選取視窗取得檔案路徑
     video_path = select_video_file()
-
     if not video_path:
         print("[錯誤] 未選取任何影片檔案，程式已結束。")
         sys.exit()
 
-    print(f"[已匯入影片]: {video_path}")
-
-    if selected_mode == "train-vehicle":
-        collect_vehicle_training_data(video_path, args.vehicle_epochs, args.vehicle_sample_frames,
-                                      train_after_save=args.enable_learning)
-        sys.exit()
-
-    trained_car_model = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rc_car_model.pt")
-    use_trained_model = os.path.exists(trained_car_model)
-    car_model_path = args.car_model or (trained_car_model if use_trained_model else "yolo11n-seg.pt")
-
-    # 強制使用自訂遙控車模型時，class ID 必須為 0；否則 YOLO 會查找錯誤類別並直接漏檢
-    vehicle_class = 0 if (use_trained_model or args.car_model is not None) else args.vehicle_class
-    if use_trained_model:
-        print(f"[車輛模型] 使用已訓練模型: {trained_car_model}")
-        print(f"[車輛模型] 強制 class_id = {vehicle_class}")
-
-    merge_values = (
-        args.track_merge_iou,
-        args.track_merge_center_ratio,
-        args.track_merge_containment,
-    )
-    if any(value < 0 or value > 1 for value in merge_values) or args.track_merge_min_distance < 0:
-        print("[錯誤] 追蹤合併參數範圍無效：比例需介於 0 與 1，距離不可小於 0。")
-        sys.exit(1)
-
-    # 建立判分系統實體
-    analyzer = DriftJudgeSystem(
-        video_path=video_path,
-        track_model_path=args.track_model,
-        sample_frames=args.sample_frames,
-        speed_window_frames=args.speed_window_frames,
-        track_interval=args.track_interval,
-        track_merge_iou=args.track_merge_iou,
-        track_merge_center_ratio=args.track_merge_center_ratio,
-        track_merge_min_distance=args.track_merge_min_distance,
-        track_merge_containment=args.track_merge_containment,
-        enable_learning=args.enable_learning or selected_mode == "train-track",
-        car_model_path=car_model_path,
-        vehicle_class=vehicle_class
-    )
-    
-    # 1. 方案 A 自動辨識 + 方案 B 介面互動確認
-    try:
-        if analyzer.setup_zones_interactive():
-            if selected_mode == "score":
-                analyzer.process_video()
-            else:
-                print("[跑道訓練] 標註完成；按 Enter 接受手繪結果後，會保存並訓練跑道模型。")
-    except KeyboardInterrupt:
-        cv2.destroyAllWindows()
-        print("\n[系統] 使用者中止分析，程式已安全結束。")
+    _run_video_mode(args, selected_mode, video_path)
